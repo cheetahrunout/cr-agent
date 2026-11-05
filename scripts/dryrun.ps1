@@ -37,7 +37,7 @@ Run $Go @("build", "-tags", "debug", "-o", "$bin\signtool.exe", "./cmd/signtool"
 Run $Go @("build", "-tags", "debug", "-o", "$bin\fakehub.exe", "./cmd/fakehub")
 foreach ($v in "0.1.0", "0.1.1", "0.1.2", "0.1.3") {
     $ld = "-X main.version=$v"
-    if ($v -eq "0.1.2") { $ld += " -X main.sabotage=unhealthy" }
+    if ($v -eq "0.1.2") { $ld += " -X main.sabotage=unhealthy-$v" }
     New-Item -ItemType Directory -Force "$bin\$v" | Out-Null
     Run $Go @("build", "-tags", "debug", "-ldflags", $ld, "-o", "$bin\$v\cragent.exe", "./cmd/cragent")
     Copy-Item "$bin\launcher.exe" "$bin\$v\launcher.exe"

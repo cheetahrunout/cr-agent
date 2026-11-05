@@ -6,9 +6,38 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
 )
+
+// The rollback test's switch names one version: any other value, or the same link flag on another
+// version, leaves a healthy build.
+func TestNeverHealthy(t *testing.T) {
+	sv, vv := sabotage, version
+	defer func() { sabotage, version = sv, vv }()
+	version = "0.1.2"
+	for s, want := range map[string]bool{"": false, "unhealthy": false, "unhealthy-0.1.1": false, "unhealthy-0.1.2": true, "UNHEALTHY-0.1.2": false} {
+		sabotage = s
+		if neverHealthy() != want {
+			t.Errorf("sabotage %q on 0.1.2: %v", s, !want)
+		}
+	}
+	version = "0.1.3"
+	sabotage = "unhealthy-0.1.2"
+	if neverHealthy() {
+		t.Error("a later version linked with the old flag is unhealthy")
+	}
+}
+
+func TestBootstrapDelay(t *testing.T) {
+	want := []time.Duration{time.Minute, 5 * time.Minute, time.Hour, time.Hour}
+	for i, d := range want {
+		if got := bootstrapDelay(i); got != d {
+			t.Errorf("try %d: %v", i, got)
+		}
+	}
+}
 
 func TestDeriveID(t *testing.T) {
 	for in, want := range map[string]string{

@@ -14,10 +14,10 @@
     }
   ],
   "stderr_allow": [
-    "listening on http://127\\.0\\.0\\.1:\\d+$",
-    "server_run_i: model loaded$",
-    "(?i)\\bcuda\\b|ggml_cuda",
-    "(?i)out of memory|failed to (load|allocate|initiali[sz]e)|error loading model|unable to load",
-    "offloaded \\d+/\\d+ layers to GPU"
+    "^\\S+ I srv\\s+server_on_li: listening on http://127\\.0\\.0\\.1:\\d+$",
+    "^\\S+ I srv\\s+server_run_i: model loaded$",
+    "^\\S+ E (srv\\s+|cmn\\s+)?(load_model|server_run_i|common_init_|llama_model_load|llama_model_load_from_file_impl|llama_init_from_model|gguf_init_from_reader): ",
+    "^\\S+ E (ggml_backend_cuda\\w*|ggml_backend_buft\\w*|ggml_cuda\\w*|ggml_gallocr\\w*|alloc_tensor_range): ",
+    "^CUDA error: "
   ]
 }

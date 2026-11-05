@@ -189,6 +189,9 @@ func previousSeq(o signOptions, keys []trust.Key) (seq int64, version string, er
 // signDist is the signing step without the console: re-hash the folder (fail closed), set the fields
 // the signer owns, refuse a key that is not in the trust list, sign, and verify the result.
 func signDist(o signOptions, key *sign.Key, keys []trust.Key) (*release.Manifest, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("this signtool was built before any key was in protocol/release-keys.json, so it can sign nothing. Pull the repository, rebuild it, and sign again. Nothing was signed")
+	}
 	if _, ok := trust.Lookup(keys, key.ID); !ok {
 		return nil, fmt.Errorf("this passphrase gives key %s, which is not in the trust list of this tool: a typo in the passphrase? Nothing was signed", key.ID)
 	}
@@ -265,7 +268,11 @@ func cmdSign(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("signed: version %s, release_seq %d, key %s\nUpload manifest.json and its .minisig, then publish the release.\n", m.Version, m.ReleaseSeq, key.ID)
+	fmt.Printf("signed: version %s, release_seq %d, key %s\n", m.Version, m.ReleaseSeq, key.ID)
+	if m.Notes != "" {
+		fmt.Printf("notes:  %s\n", m.Notes)
+	}
+	fmt.Println("Upload manifest.json and manifest.json.minisig, then publish the release.")
 	return nil
 }
 

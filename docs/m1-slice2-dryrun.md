@@ -67,3 +67,30 @@ killing the launcher ended the agent.
 The release installer (`scripts\build-installer.ps1 -Version 0.1.0 -EngineDir <b12125>`) also builds, in 37 s: installer 562 MB,
 agent archive 5.8 MB, engine archive 609 MB, and an unsigned `manifest.json` with 58 files and 3 archives. It was not run: a release
 build refuses to start until a production key is in `protocol/release-keys.json`.
+
+## Release-build rehearsal (pre-flight, 2026-11-06)
+
+Real release binaries and installers, built by `scripts\build-installer.ps1` in a scratch copy of the repository whose
+`protocol/release-keys.json` held a rehearsal key from a throwaway passphrase. The copy, the key and the passphrase were deleted
+afterwards. The passphrase was typed through a Windows pseudo-console (ConPTY), the real `CONIN$` path, by a small harness.
+
+| Check | Result |
+| --- | --- |
+| `signtool pubkey` at the console | key derived; input not echoed |
+| one wrong letter; three words | refused; nothing written |
+| `sign` of 0.1.0 `-first`, 0.1.1 and 0.1.2 `-prev` | `release_seq` 1, 2, 3, about 25 s each; `verify` ok; only 0.1.2 prints the `ROLLBACK TEST` note |
+| layout-check installer with the release binaries, silent, into a scratch folder | installed; no autostart, no Start menu entry, no uninstall entry |
+| start through the launcher with a scratch `--home`, unpaired | no exit 2; tray window up, owned by the agent; `healthy.0.1.0` written after 0.25 s |
+| first-start manifest while the release is not on GitHub | HTTP 404 logged as a warning, retry after 1 min, then 5, then hourly; one agent start, no crash loop, no revert; About says so |
+| remote addresses while unpaired | GitHub's only |
+| `--key` with a random, well-formed, unknown key | dialled the production hub, which closed with 4000; "key not accepted; retrying hourly"; key in no log |
+| `--hf-base`, `--release-base`, `--approve`, `--hub` to any other host, malformed `--key` | launcher exits 2 each time, no restart |
+| signed 0.1.0 beside the install | verified, `committed_seq` 1 |
+| signed 0.1.1 on trial, with the real engine and SmolLM2 | gate passed after 0.7 s, `committed_seq` 2; engine files checked, low integrity, model loaded |
+| the rollback-test 0.1.2 on trial, real release binary | never healthy; reverted after 120.4 s (`not healthy within 2m0s`); 0.1.1 started at once |
+
+The release build cannot reach a local release server, so 0.1.1 and 0.1.2 were placed on disk with the pointer written by hand, as
+the updater leaves them. The fetch from GitHub in a release build was exercised only up to its 404.
+
+Not exercised: the real installer's Start menu shortcut, autostart task and uninstaller (it was compiled, not run, because it writes
+outside a scratch folder); `release.yml` on GitHub (its gate script was run locally for every case); `gh release download` of a draft.

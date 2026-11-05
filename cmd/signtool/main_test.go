@@ -103,8 +103,8 @@ func TestRefusesAKeyThatIsNotTrusted(t *testing.T) {
 		t.Fatal("something was written for an untrusted key")
 	}
 	// With an empty trust list (a release build today) nothing can be signed at all.
-	if _, err := signDist(signOptions{Dist: dir, First: true, Now: time.Now()}, sign.ThrowawayKey(), nil); err == nil {
-		t.Fatal("signed with an empty trust list")
+	if _, err := signDist(signOptions{Dist: dir, First: true, Now: time.Now()}, sign.ThrowawayKey(), nil); err == nil || !strings.Contains(err.Error(), "rebuild") || strings.Contains(err.Error(), "typo") {
+		t.Fatalf("with an empty trust list: %v", err)
 	}
 }
 

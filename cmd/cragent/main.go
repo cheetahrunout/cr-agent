@@ -40,9 +40,14 @@ import (
 // version is set by the release build (-ldflags "-X main.version=...").
 var version = "0.1.0"
 
-// sabotage is set only in the dry run's deliberately broken build (-X main.sabotage=unhealthy):
-// a debug agent that never passes the health gate, so the launcher has something to revert.
+// sabotage is empty in every build but the rollback test's (PLAN ruling B27), which is linked with
+// -X main.sabotage=unhealthy-<its own version>: that one binary never passes the health gate, so the
+// launcher has something to revert. It is a link-time string naming one version: nothing at run time
+// can set it, and the source on main has no broken path of its own.
 var sabotage string
+
+// neverHealthy reports whether this binary is the rollback test's.
+func neverHealthy() bool { return sabotage == "unhealthy-"+version }
 
 // llamaTag is the pinned llama.cpp build, from engine.lock.
 var llamaTag = enginelock.Pinned().Tag
@@ -257,8 +262,8 @@ func (ap *app) exitCode() int {
 // its tray is up, and it reached welcome or made three connection attempts. It then writes
 // healthy.<version>, which the launcher waits for, and commits the release.
 func (ap *app) healthGate() {
-	if debugBuild && sabotage == "unhealthy" {
-		ap.log.Warn("this build is deliberately unhealthy: it never passes the health gate")
+	if neverHealthy() {
+		ap.log.Warn("this build is the rollback test: it never passes the health gate", "version", version)
 		return
 	}
 	for {
@@ -277,18 +282,32 @@ func (ap *app) healthGate() {
 }
 
 // bootstrap fetches and checks the manifest of a freshly installed version (the installer cannot
-// carry the manifest that lists the installer itself).
+// carry the manifest that lists the installer itself). A PC that is offline or a release not
+// published yet is no reason to stop the agent: it runs unverified, says so in About, and keeps trying.
 func (ap *app) bootstrap() {
-	for try := 0; try < 3; try++ {
+	for try := 0; ; try++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		err := ap.up.Bootstrap(ctx)
 		cancel()
 		if err == nil {
+			ap.requestRefresh()
 			return
 		}
-		ap.log.Warn("the manifest of this version could not be fetched and checked yet", "err", err.Error())
-		time.Sleep(time.Minute)
+		ap.log.Warn("this version's signed manifest could not be checked yet; the agent runs on and tries again",
+			"err", err.Error(), "next_retry_min", int(bootstrapDelay(try)/time.Minute))
+		time.Sleep(bootstrapDelay(try))
 	}
+}
+
+// bootstrapDelay is one minute, then five, then an hour for as long as it takes.
+func bootstrapDelay(try int) time.Duration {
+	switch try {
+	case 0:
+		return time.Minute
+	case 1:
+		return 5 * time.Minute
+	}
+	return time.Hour
 }
 
 func (ap *app) signalQuit() {
@@ -606,6 +625,9 @@ func (ap *app) onAction(a tray.Action, arg string) {
 		text := "CR Agent " + version + "\nllama.cpp " + llamaTag
 		if c.Slug != "" {
 			text += "\nThis PC: " + c.Slug + " (key id " + c.KeyID + ")"
+		}
+		if ap.up != nil && ap.up.Unverified() {
+			text += "\nThis version's signed manifest could not be checked yet (offline, or the release is not published). Trying again."
 		}
 		ui.Info(text)
 	case tray.ActQuit:

@@ -145,6 +145,13 @@ func (u *Updater) save(st state) error {
 	return u.cfg.Store.WriteSecret(secretRelease, b)
 }
 
+// Unverified reports that the running version has no checked manifest yet (see Bootstrap).
+func (u *Updater) Unverified() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.needFetch
+}
+
 // Committed is the release sequence and version this PC is committed to.
 func (u *Updater) Committed() (int64, string) {
 	st := u.load()

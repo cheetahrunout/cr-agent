@@ -6,6 +6,9 @@
 #   -DebugBuild   debug binaries (they trust the throwaway test key and have a console); never published
 #   -Scratch      the layout-check installer: no Start menu entry, no autostart, no uninstall entry, no compression
 #   -NoInstaller  only the binaries and the zips (when Inno Setup is not there)
+#   -RollbackTest the deliberately unhealthy release of PLAN ruling B27: this one agent never passes the
+#                 health gate, so the launcher must revert it. Linked in with -X main.sabotage=unhealthy-<version>;
+#                 nothing in the source changes, and the manifest's notes say what it is.
 #
 # Output, under -Out (default build\release\<version>):
 #   stage\                                   the install layout the installer packs
@@ -21,7 +24,8 @@ param(
     [string]$Iscc = "",
     [switch]$DebugBuild,
     [switch]$Scratch,
-    [switch]$NoInstaller
+    [switch]$NoInstaller,
+    [switch]$RollbackTest
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -51,6 +55,7 @@ if ($DebugBuild) {
     $common = @("build", "-trimpath")
     $ldAgent = "-s -w -H windowsgui -X main.version=$Version"; $ldLauncher = "-s -w -H windowsgui"
 }
+if ($RollbackTest) { $ldAgent += " -X main.sabotage=unhealthy-$Version" }
 Run $Go ($common + @("-ldflags", $ldAgent, "-o", "$stage\versions\$Version\cragent.exe", "./cmd/cragent"))
 Run $Go ($common + @("-ldflags", $ldLauncher, "-o", "$stage\launcher.exe", "./cmd/launcher"))
 Copy-Item "$stage\launcher.exe" "$stage\versions\$Version\launcher.exe"
@@ -85,7 +90,9 @@ if (-not $NoInstaller) {
 
 # 5. The unsigned manifest: every archive and every installed file with size and SHA-256.
 if (-not $Scratch) {
-    Run "$tools\signtool.exe" @("manifest", "-dist", $dist, "-version", $Version)
+    $manifestArgs = @("manifest", "-dist", $dist, "-version", $Version)
+    if ($RollbackTest) { $manifestArgs += @("-notes", "ROLLBACK TEST: this agent never passes the health gate. Never offer it to friends.") }
+    Run "$tools\signtool.exe" $manifestArgs
 }
 ""
 Get-ChildItem $dist | ForEach-Object { "{0,14:n0}  {1}" -f $_.Length, $_.Name }

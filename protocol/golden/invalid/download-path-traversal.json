@@ -1,0 +1,3 @@
+{ "_reason": "file names may not contain '..' or a third path segment",
+  "v": 1, "t": "cmd", "id": "c-01JCKZ3Q9X8YB7N6M5P4R3S2T5", "op": "download",
+  "args": { "model_id": "evil", "repo": "someone/repo", "commit": "7c1e2a9d40b3f1e8a9c0d2b4e6f8a1c3e5d7f9b2", "files": ["../../Windows/system32/evil.gguf"], "kind": "gguf" } }

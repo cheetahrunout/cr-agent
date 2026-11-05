@@ -1,0 +1,2 @@
+{ "v": 1, "t": "req", "id": "r-01JCKZ3Q9X8YB7N6M5P4R3S2T3", "path": "/v1/chat/completions", "stream": true,
+  "body": { "model": "qwen3-14b-q4_k_m", "messages": [{ "role": "user", "content": "How do I cancel a context in Go?" }], "stream": true, "stream_options": { "include_usage": true }, "max_tokens": 512 } }

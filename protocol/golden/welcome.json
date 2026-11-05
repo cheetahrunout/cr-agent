@@ -1,0 +1,1 @@
+{ "v": 1, "t": "welcome", "proto": "1.0", "mode": "normal", "ping_interval_s": 25, "limits": { "max_frame": 262144, "max_body": 262144 }, "hub_version": "1.0.12", "min_agent_version": "0.1.0" }

@@ -1,0 +1,2 @@
+{ "_reason": "req.path must be one of the three allowed paths",
+  "v": 1, "t": "req", "id": "r-01JCKZ3Q9X8YB7N6M5P4R3S2T6", "path": "/slots", "stream": false, "body": {} }

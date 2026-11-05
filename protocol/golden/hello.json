@@ -1,0 +1,28 @@
+{
+  "v": 1, "t": "hello",
+  "agent_version": "0.1.0", "proto": "1.0", "platform": "windows-amd64", "backend": "cuda",
+  "capabilities": ["chunked_bodies", "config", "inspect"],
+  "supported_archs": ["llama", "qwen2", "qwen3", "qwen3moe", "gemma3", "gpt-oss"],
+  "llama_tag": "b7000",
+  "hardware": {
+    "pools": [
+      { "id": "gpu0", "kind": "dedicated", "name": "NVIDIA GeForce RTX 5090", "total_mb": 32607, "free_mb": 31000, "backend": "cuda", "display": true },
+      { "id": "host", "kind": "host", "total_mb": 65536, "free_mb": 40000 }
+    ],
+    "cpu": { "name": "AMD Ryzen 9 9950X", "physical": 16, "logical": 32 },
+    "ram_mb": 65536, "disk_free_mb": 1200000, "disk_total_mb": 1900000,
+    "os": "Windows 11 Pro 10.0.26200", "driver": "610.88", "cuda": "13.3"
+  },
+  "engine": "unloaded",
+  "models": [
+    { "model_id": "qwen3-14b-q4_k_m", "repo": "unsloth/Qwen3-14B-GGUF", "commit": "7c1e2a9d40b3f1e8a9c0d2b4e6f8a1c3e5d7f9b2",
+      "files": [{ "path": "Qwen3-14B-Q4_K_M.gguf", "size": 9000000000, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }],
+      "kind": "gguf", "state": "ready", "size_bytes": 9000000000 }
+  ],
+  "jobs": [],
+  "inflight": [],
+  "last_disconnect_reason": "sleep",
+  "local_pause": false,
+  "hf_token": "absent",
+  "driver_ok": true
+}

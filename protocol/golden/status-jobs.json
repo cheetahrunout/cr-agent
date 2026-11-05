@@ -1,0 +1,8 @@
+{ "v": 1, "t": "status", "engine": "loaded", "model_id": "qwen3-14b-q4_k_m",
+  "settings_in_use": { "ctx": 32768, "gpu_layers": "all", "threads": 16, "kv_type": "f16", "flash_attn": "on", "parallel": 1 },
+  "measured_vram_mb": 10800,
+  "jobs": [
+    { "model_id": "wizard-x-q4_k_m", "kind": "approval", "state": "awaiting_click", "awaiting_click": true },
+    { "model_id": "my-finetune-q5_k_m", "kind": "download", "state": "running", "pct": 63.2, "bytes_done": 6200000000, "bytes_total": 9800000000 }
+  ],
+  "local_pause": false }

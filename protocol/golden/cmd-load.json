@@ -1,0 +1,2 @@
+{ "v": 1, "t": "cmd", "id": "c-01JCKZ3Q9X8YB7N6M5P4R3S2T1", "op": "load",
+  "args": { "model_id": "qwen3-14b-q4_k_m", "settings": { "ctx": 32768, "gpu_layers": "all", "threads": 16, "kv_type": "f16", "flash_attn": "on", "parallel": 1 } } }

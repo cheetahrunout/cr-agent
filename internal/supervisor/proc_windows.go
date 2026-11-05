@@ -24,6 +24,7 @@ type proc struct {
 	waitOnce sync.Once
 	done     chan struct{}
 	exitCode uint32
+	peak     uint64
 }
 
 // spawnOptions controls how the child is started.
@@ -178,9 +179,32 @@ func (p *proc) Kill() {
 	windows.TerminateJobObject(p.job, 1)
 	<-p.done
 	p.waitOnce.Do(func() {
+		p.peak = p.jobPeak() // the job remembers its peak after the process is gone, until the handle closes
 		windows.CloseHandle(p.handle)
 		windows.CloseHandle(p.job) // KILL_ON_JOB_CLOSE: also the safety net if TerminateJobObject failed
 	})
+}
+
+// jobPeak is the most memory the job ever had committed, the figure the job memory cap is held against.
+func (p *proc) jobPeak() uint64 {
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	if err := windows.QueryInformationJobObject(p.job, windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
+		return 0
+	}
+	return uint64(info.PeakJobMemoryUsed)
+}
+
+// PeakMemory is the job's peak committed memory in bytes: live while the engine runs, final after Kill.
+func (p *proc) PeakMemory() uint64 {
+	select {
+	case <-p.done:
+		if p.peak != 0 {
+			return p.peak
+		}
+	default:
+	}
+	return p.jobPeak()
 }
 
 // lowIntegrityToken duplicates our primary token and lowers it to the low mandatory level (S-1-16-4096).

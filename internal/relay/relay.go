@@ -115,6 +115,24 @@ func (r *Relay) Cancel(id string) bool {
 	return ok
 }
 
+// CancelAll aborts every request in flight (pause, sleep).
+func (r *Relay) CancelAll() {
+	r.mu.Lock()
+	fs := make([]flight, 0, len(r.inflight))
+	for _, f := range r.inflight {
+		fs = append(fs, f)
+	}
+	r.mu.Unlock()
+	for _, f := range fs {
+		f.cancel(errCancelled)
+	}
+}
+
+// Refuse answers a request without the engine: an error body, then res.end{error}.
+func (r *Relay) Refuse(s Sender, id string, status int, code, msg string) {
+	r.localError(s, id, status, code, msg)
+}
+
 // Inflight lists the ids still live (a request whose socket is gone is already dead).
 func (r *Relay) Inflight() []string {
 	r.mu.Lock()

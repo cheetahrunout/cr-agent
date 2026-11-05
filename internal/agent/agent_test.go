@@ -120,18 +120,19 @@ func (h *hub) next(t string, d time.Duration) map[string]any {
 	}
 }
 
-func setup(t *testing.T) (*Agent, *fakeEngine, chan *hub, context.CancelFunc) {
+func setup(t *testing.T) (*Agent, *fakeEngine, chan *hub, func()) {
 	fe := newFakeEngine(t)
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	a := New(Config{
-		Version: "0.0.1", LlamaTag: "test", ModelID: "smollm2-360m-q8_0", Log: log,
-		Limits: supervisor.Limits{LogicalCores: 4},
+		Version: "0.0.1", LlamaTag: "test", LocalModelID: "smollm2-360m-q8_0", LocalModelPath: "local.gguf", Log: log,
+		LogicalCores: 4,
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
-			if c.Alias != "smollm2-360m-q8_0" {
-				return nil, fmt.Errorf("alias %q", c.Alias)
+			if c.Alias != "smollm2-360m-q8_0" || c.ModelPath != "local.gguf" {
+				return nil, fmt.Errorf("alias %q path %q", c.Alias, c.ModelPath)
 			}
 			return &fakeHandle{base: fe.srv.URL, done: make(chan struct{})}, nil
 		},
+		TuneLink: func(c *link.Config) { c.BaseDelay, c.MaxDelay = 10*time.Millisecond, 50*time.Millisecond },
 	})
 	hubs := make(chan *hub, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -148,10 +149,8 @@ func setup(t *testing.T) (*Agent, *fakeEngine, chan *hub, context.CancelFunc) {
 		<-r.Context().Done()
 	}))
 	t.Cleanup(srv.Close)
-	ctx, cancel := context.WithCancel(context.Background())
-	cl := link.New(link.Config{URL: "ws" + strings.TrimPrefix(srv.URL, "http") + "/agent", Key: "crm_x_y", Handler: a, Log: log,
-		BaseDelay: 10 * time.Millisecond, MaxDelay: 50 * time.Millisecond})
-	go cl.Run(ctx)
+	a.Connect("ws"+strings.TrimPrefix(srv.URL, "http")+"/agent", "crm_x_y")
+	cancel := a.Disconnect
 	t.Cleanup(cancel)
 	return a, fe, hubs, cancel
 }

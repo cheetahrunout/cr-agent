@@ -28,3 +28,5 @@ func (p *proc) Kill()                   {}
 func portOwner(int) (uint32, error)     { return 0, errors.New("Windows only") }
 
 func (p *proc) Integrity() string { return "unknown" }
+
+func (p *proc) PeakMemory() uint64 { return 0 }

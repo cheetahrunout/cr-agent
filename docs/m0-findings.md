@@ -30,8 +30,12 @@ is not writable at low IL. That costs nothing for prebuilt kernels, but a GPU ar
 - `KILL_ON_JOB_CLOSE`: hard-killing the agent (`Stop-Process -Force`) killed llama-server within 0.7 s.
 - `ACTIVE_PROCESS_LIMIT 1`: a child that tries to start a grandchild gets "Not enough quota is available"
   (`TestJobBlocksGrandchildren`).
-- Job memory cap = RAM − 4 GiB (58 937 MB here) is set; the tiny model loaded under it. **B15's check with a partially
-  offloaded 14B model is still open.**
+- Job memory cap = RAM − 4 GiB (58 937 MB here) is set; the tiny model loaded under it.
+- **B15's check with a partly offloaded large model, done in M1 slice 1:** `Qwen3.6Q6_K.gguf` (27.3 GB, `qwen35moe`, 40 blocks)
+  with `gpu_layers: 20`, `ctx: 8192`, low integrity, under the same cap. It loaded in 9.1 s (file already in the page cache)
+  and answered at about 30 tokens/s. The job's peak committed memory was 16 186 MB, far under the cap: the layers kept on the
+  CPU are memory-mapped file pages, which do not count as committed memory. GPU memory in use rose from 3.9 GB to 18.3 GB.
+  The cap does not stop a partly offloaded load. The agent now logs `peak_job_mb` when an engine stops.
 - The child environment drops every `LLAMA_*` variable: llama-server reads `LLAMA_ARG_*` as flags, so a variable on the PC could
   otherwise add flags the agent did not choose (`TestChildEnvDropsLlamaVars`).
 - "Stop cleanly" = `TerminateJobObject` and a wait for exit. llama-server has no shutdown endpoint, and with `--no-slots` it

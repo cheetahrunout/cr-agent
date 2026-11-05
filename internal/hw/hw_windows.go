@@ -146,3 +146,16 @@ func osName() string {
 	}
 	return fmt.Sprintf("%s %d.%d.%d", name, v.MajorVersion, v.MinorVersion, v.BuildNumber)
 }
+
+// DiskSpace reports the bytes free to this user and the size of the volume holding path.
+func DiskSpace(path string) (free, total uint64, err error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	var totalFree uint64
+	if err := windows.GetDiskFreeSpaceEx(p, &free, &total, &totalFree); err != nil {
+		return 0, 0, fmt.Errorf("GetDiskFreeSpaceEx: %w", err)
+	}
+	return free, total, nil
+}

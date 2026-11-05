@@ -134,6 +134,9 @@ func (e *Engine) Target() (base, key, alias string) { return e.base, e.key, e.al
 // PID is the engine's process id.
 func (e *Engine) PID() uint32 { return e.p.PID() }
 
+// PeakMemory is the most memory the engine's job ever had committed, in bytes.
+func (e *Engine) PeakMemory() uint64 { return e.p.PeakMemory() }
+
 // Done is closed when the engine process exits.
 func (e *Engine) Done() <-chan struct{} { return e.p.Done() }
 
@@ -144,13 +147,14 @@ func (e *Engine) ExitCode() uint32 { return e.p.ExitCode() }
 // llama-server keeps no state worth saving (no slots, no prompt cache on disk), so terminating
 // the job is the clean stop.
 func (e *Engine) Stop() {
+	peak := e.p.PeakMemory()
 	e.p.Kill()
 	select {
 	case <-e.pumpDone:
 	case <-time.After(2 * time.Second):
 	}
 	e.p.out.Close()
-	e.log.Info("engine stopped", "pid", e.p.PID(), "suppressed_lines", e.suppressed.Load())
+	e.log.Info("engine stopped", "pid", e.p.PID(), "suppressed_lines", e.suppressed.Load(), "peak_job_mb", peak>>20)
 }
 
 // Engine output is filtered before it reaches the agent log (ruling B16): only lines matching this

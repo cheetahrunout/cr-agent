@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,6 +134,52 @@ func TestUnauthorizedUpgradeIsSlowRetry(t *testing.T) {
 	cl.Run(context.Background())
 	if got != time.Hour {
 		t.Fatalf("delay after 401 = %v, want 1h", got)
+	}
+}
+
+// A refused upgrade with HTTP 429 means "wait Retry-After, then retry": not a bad key, not a removal.
+func TestTooManyRequestsWaitsRetryAfter(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch n.Add(1) {
+		case 1:
+			w.Header().Set("Retry-After", "7")
+			http.Error(w, `{"error":{"code":"rate_limit_exceeded"}}`, http.StatusTooManyRequests)
+		case 2:
+			http.Error(w, "slow down", http.StatusTooManyRequests) // no Retry-After: a minute
+		default:
+			w.Header().Set("Retry-After", "99999") // capped at the slow retry
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+		}
+	}))
+	defer srv.Close()
+	var sleeps []time.Duration
+	var phases []Phase
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cl := New(Config{URL: wsURL(srv), Key: "crm_x_y", Handler: &nopHandler{},
+		Rand:    func(n int64) int64 { return n - 1 },
+		OnPhase: func(p Phase) { phases = append(phases, p) },
+		Sleep:   func(context.Context, time.Duration) error { return nil }})
+	cl.cfg.Sleep = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		if len(sleeps) == 3 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+	if err := cl.Run(ctx); errors.Is(err, ErrRevoked) {
+		t.Fatal("429 was treated as a removal")
+	}
+	want := []time.Duration{7*time.Second + 3*time.Second, time.Minute + 3*time.Second, time.Hour + 3*time.Second}
+	if len(sleeps) != 3 || sleeps[0] != want[0] || sleeps[1] != want[1] || sleeps[2] != want[2] {
+		t.Fatalf("sleeps %v, want %v", sleeps, want)
+	}
+	for _, p := range phases {
+		if p == PhaseKeyRejected || p == PhaseRemoved {
+			t.Fatalf("429 produced phase %q", p)
+		}
 	}
 }
 

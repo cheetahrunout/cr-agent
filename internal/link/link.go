@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,6 +25,20 @@ const (
 	CloseUpgradeRequired = 4001
 	CloseReplaced        = 4002
 	CloseRevoked         = 4003
+)
+
+// Phase is where the link stands, for the tray's status line.
+type Phase string
+
+// Phases.
+const (
+	PhaseConnecting     Phase = "connecting"
+	PhaseConnected      Phase = "connected"       // welcome received
+	PhaseDown           Phase = "down"            // lost; retrying with backoff
+	PhaseKeyRejected    Phase = "key_rejected"    // 4000 or HTTP 401/403 on the upgrade; retrying hourly
+	PhaseUpdateRequired Phase = "update_required" // 4001; retrying hourly
+	PhaseReplaced       Phase = "replaced"        // 4002; retrying hourly
+	PhaseRemoved        Phase = "removed"         // 4003; stopped for good
 )
 
 // MaxPayload is the hard frame limit on both sides (§10.1).
@@ -58,6 +73,9 @@ type Config struct {
 	HealthyAfter time.Duration // 60 s: a session this long resets the backoff
 	GoingAway    time.Duration // 3 s: max delay after 1001/1012
 	SlowRetry    time.Duration // 1 h: after 4000, 4001, 4002 or an HTTP 401/403 on the upgrade
+
+	// OnPhase is told every change of phase. It must not block.
+	OnPhase func(Phase)
 
 	// Sleep waits between attempts; tests replace it. Returns ctx.Err() when cancelled.
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -95,6 +113,9 @@ func New(cfg Config) *Client {
 			return rand.Int64N(n)
 		}
 	}
+	if cfg.OnPhase == nil {
+		cfg.OnPhase = func(Phase) {}
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
 	}
@@ -121,6 +142,7 @@ type outcome struct {
 	code     websocket.StatusCode // -1 when there was no close frame
 	httpCode int                  // status of a refused upgrade
 	lasted   time.Duration        // time from upgrade to loss, 0 when the dial failed
+	retry    time.Duration        // Retry-After of a refused upgrade, 0 when absent
 	reason   string
 }
 
@@ -139,6 +161,7 @@ func Backoff(n int, base, max time.Duration, rnd func(int64) int64) time.Duratio
 func (c *Client) Run(ctx context.Context) error {
 	n := 0
 	for {
+		c.cfg.OnPhase(PhaseConnecting)
 		o := c.connectOnce(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -150,19 +173,36 @@ func (c *Client) Run(ctx context.Context) error {
 		switch {
 		case o.code == CloseRevoked:
 			c.log.Error("link stopped: this PC was removed from the hub", "code", int(o.code))
+			c.cfg.OnPhase(PhaseRemoved)
 			return ErrRevoked
 		case o.code == CloseBadKey || o.httpCode == http.StatusUnauthorized || o.httpCode == http.StatusForbidden:
 			c.log.Error("key not accepted; retrying hourly", "code", int(o.code), "http", o.httpCode)
+			c.cfg.OnPhase(PhaseKeyRejected)
 			delay = c.cfg.SlowRetry
 		case o.code == CloseUpgradeRequired:
 			c.log.Error("update required: the hub speaks a newer protocol major", "code", int(o.code))
+			c.cfg.OnPhase(PhaseUpdateRequired)
 			delay = c.cfg.SlowRetry
 		case o.code == CloseReplaced:
 			c.log.Warn("replaced by another connection with this machine's key; retrying hourly", "code", int(o.code))
+			c.cfg.OnPhase(PhaseReplaced)
 			delay = c.cfg.SlowRetry
+		case o.httpCode == http.StatusTooManyRequests:
+			// The hub is slowing this address or this machine down (a block after bad keys, or reconnects
+			// that came too fast). It says how long; wait that, plus a little jitter, and try again.
+			// This is not a key problem and not a removal.
+			c.cfg.OnPhase(PhaseDown)
+			wait := o.retry
+			if wait <= 0 {
+				wait = time.Minute
+			}
+			delay = min(wait, c.cfg.SlowRetry) + time.Duration(c.cfg.Rand(int64(c.cfg.GoingAway)+1))
+			c.log.Warn("the hub asked this PC to wait before reconnecting", "wait_s", int(delay/time.Second))
 		case o.code == websocket.StatusServiceRestart || o.code == websocket.StatusGoingAway:
+			c.cfg.OnPhase(PhaseDown)
 			delay = time.Duration(c.cfg.Rand(int64(c.cfg.GoingAway) + 1))
 		default:
+			c.cfg.OnPhase(PhaseDown)
 			delay = Backoff(n, c.cfg.BaseDelay, c.cfg.MaxDelay, c.cfg.Rand)
 			n++
 		}
@@ -188,6 +228,9 @@ func (c *Client) connectOnce(ctx context.Context) outcome {
 		if resp != nil {
 			o.httpCode = resp.StatusCode
 			o.reason = fmt.Sprintf("upgrade refused: HTTP %d", resp.StatusCode)
+			if n, perr := strconv.Atoi(resp.Header.Get("Retry-After")); perr == nil && n > 0 {
+				o.retry = time.Duration(n) * time.Second
+			}
 		}
 		c.log.Warn("dial failed", "err", err.Error(), "http", o.httpCode)
 		return o
@@ -197,7 +240,7 @@ func (c *Client) connectOnce(ctx context.Context) outcome {
 	c.log.Info("link up")
 
 	sctx, cancel := context.WithCancel(ctx)
-	s := &Session{ctx: sctx, out: make(chan []byte, 64), log: c.log}
+	s := &Session{ctx: sctx, out: make(chan outMsg, 64), log: c.log}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); s.writer(conn, cancel) }()
@@ -250,6 +293,7 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, s *Session)
 			clampWelcome(f)
 			c.log.Info("welcome", "proto", f.Proto, "mode", f.Mode, "ping_interval_s", f.PingIntervalS)
 			c.cfg.Handler.OnWelcome(s, f)
+			c.cfg.OnPhase(PhaseConnected)
 		case *protocol.Reject:
 			c.log.Warn("hub rejected the connection", "code", f.Code) // hub text is never shown locally
 		case *protocol.Cmd, *protocol.Req, *protocol.ReqBody, *protocol.Cancel:
@@ -305,8 +349,24 @@ func clampWelcome(w *protocol.Welcome) {
 // Session is one live socket. Its context ends when the socket is lost.
 type Session struct {
 	ctx context.Context
-	out chan []byte
+	out chan outMsg
 	log *slog.Logger
+}
+
+// outMsg is a frame for the writer, or a request to close the socket after the frames before it.
+type outMsg struct {
+	data   []byte
+	close  bool
+	code   websocket.StatusCode
+	reason string
+}
+
+// Close sends a close frame with code after every frame already queued (1001 before the PC sleeps).
+func (s *Session) Close(code int, reason string) {
+	select {
+	case s.out <- outMsg{close: true, code: websocket.StatusCode(code), reason: reason}:
+	case <-s.ctx.Done():
+	}
 }
 
 // Context ends when the socket is lost.
@@ -328,7 +388,7 @@ func (s *Session) Send(f protocol.Frame) error {
 	default:
 	}
 	select {
-	case s.out <- b:
+	case s.out <- outMsg{data: b}:
 		return nil
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -341,9 +401,21 @@ func (s *Session) writer(conn *websocket.Conn, fail context.CancelFunc) {
 		select {
 		case <-s.ctx.Done():
 			return
-		case b := <-s.out:
+		case m := <-s.out:
+			if m.close {
+				// The close frame leaves at once; the peer's answer is awaited only briefly, so a
+				// PC going to sleep is never held up by a slow hub.
+				closed := make(chan struct{})
+				go func() { conn.Close(m.code, m.reason); close(closed) }()
+				select {
+				case <-closed:
+				case <-time.After(500 * time.Millisecond):
+				}
+				fail()
+				return
+			}
 			wctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
-			err := conn.Write(wctx, websocket.MessageText, b)
+			err := conn.Write(wctx, websocket.MessageText, m.data)
 			cancel()
 			if err != nil {
 				if s.ctx.Err() == nil {

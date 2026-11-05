@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cheetahrunout/cr-agent/internal/enginelock"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
@@ -65,6 +66,16 @@ func usage() {
 // to use the throwaway test key (see key_debug.go).
 type keySource func(confirm bool) (*sign.Key, error)
 
+// minPassphraseChars is the owner's rule (PLAN ruling B61). It is counted after normalising, because that is what the key is made from.
+const minPassphraseChars = 10
+
+func checkPassphrase(p string) error {
+	if utf8.RuneCountInString(sign.Normalize(p)) < minPassphraseChars {
+		return fmt.Errorf("the passphrase must be at least %d characters", minPassphraseChars)
+	}
+	return nil
+}
+
 func fromConsole(confirm bool) (*sign.Key, error) {
 	p, err := readPassphrase("Release passphrase: ")
 	if err != nil {
@@ -79,8 +90,8 @@ func fromConsole(confirm bool) (*sign.Key, error) {
 			return nil, errors.New("the two entries differ")
 		}
 	}
-	if len(strings.Fields(sign.Normalize(p))) < 6 {
-		return nil, errors.New("the passphrase must be at least six words (PLAN §13.1)")
+	if err := checkPassphrase(p); err != nil {
+		return nil, err
 	}
 	fmt.Fprintln(os.Stderr, "Deriving the key (Argon2id, 1 GiB)...")
 	return sign.KeyFromSeed(sign.DeriveSeed(p))

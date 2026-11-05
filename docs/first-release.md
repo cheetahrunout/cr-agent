@@ -5,11 +5,12 @@ about 10 minutes for the key, and about 30 minutes for the signing once the rele
 
 **How it works in one paragraph.** Your passphrase is the private key. Nothing is stored anywhere. Every agent carries the public half
 and refuses any update that was not signed with your passphrase. If the passphrase ever leaks, or everybody forgets it, every PC has
-to reinstall, so choose it well and keep it on paper in a safe place.
+to reinstall the agent, so choose it well and make sure it cannot be forgotten.
 
 **Rules for the passphrase.**
 
-- At least six random words. Seven is better. Pick them with dice or a word-list generator, not a sentence you would say.
+- At least 10 characters. Longer is stronger: the public key is public, so anyone can try guesses against it on their own computers, for
+  as long as they like. Avoid names, dates, song lines and common phrases.
 - Type it only into `signtool`, in a terminal window on this PC. Never in a chat, a browser, a file or a command line.
 - Capital letters and extra spaces do not matter: `Amber  COBALT` and `amber cobalt` give the same key.
 - Nothing appears on screen while you type. That is correct. Type it and press Enter.
@@ -57,14 +58,14 @@ It asks for the passphrase twice. Then it takes a few seconds and uses 1 GB of m
 | If you see | It means | Do this |
 | --- | --- | --- |
 | `the two entries differ` | a typo in one of the two | run it again |
-| `the passphrase must be at least six words` | too short | choose a longer one |
+| `the passphrase must be at least 10 characters` | too short | choose a longer one |
 | `the passphrase is typed at a console` | not in a real terminal | use *Terminal* from the Start menu |
 
 ### Step 3. Send the lead that entry
 
 Send the part from `{` to `}`. It is public, so any channel is fine. **Never send the passphrase.**
 
-Write the passphrase on paper now, and give the second admin a copy the same way, because it cannot be recovered.
+Make sure the second admin knows it too, because it cannot be recovered.
 
 ---
 

@@ -178,3 +178,19 @@ func TestNoPassphraseFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestPassphraseLength(t *testing.T) {
+	for p, ok := range map[string]bool{
+		"":              false,
+		"nine char":     false,
+		"  nine   char": false, // spaces around and between words collapse before the count
+		"ten  chars":    false,
+		"tenchars10":    true,
+		"ten chars!":    true,
+		"één twee dr":   true,
+	} {
+		if err := checkPassphrase(p); (err == nil) != ok {
+			t.Errorf("%q: got %v, want ok=%v", p, err, ok)
+		}
+	}
+}

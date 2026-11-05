@@ -91,6 +91,8 @@ jobs:
             & "$env:RUNNER_TEMP\launcher.exe"
             if ($LASTEXITCODE -ne 2) { throw "a release launcher with an empty key list exited with $LASTEXITCODE, not 2" }
             "ok: no production key yet, and the release build refuses to start"
+            # The refusals above exit with 2 on purpose; without this the step would report that as its own failure.
+            $global:LASTEXITCODE = 0
           } else {
             go run ./cmd/signtool trust-check
             if ($LASTEXITCODE -ne 0) { throw "the production key list is not fit to ship" }

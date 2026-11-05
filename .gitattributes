@@ -1,0 +1,11 @@
+# One set of bytes on every machine. Signatures, hashes and gofmt all depend on it: a Windows checkout that turned LF into
+# CRLF broke the golden signature test and made every Go file look unformatted.
+* text=auto eol=lf
+*.minisig -text
+internal/sign/testdata/** -text
+protocol/golden/** -text
+*.exe binary
+*.gguf binary
+*.ico binary
+*.png binary
+*.zip binary

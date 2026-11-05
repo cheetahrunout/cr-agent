@@ -474,6 +474,37 @@ func (h *Header) TensorSizes(fileSize uint64) (s Sizes, ok bool) {
 	return s, ok
 }
 
+// TensorBytes returns every tensor's size by name, derived like TensorSizes from the gaps between
+// offsets. ok is false when the last tensor's end is unknown (fileSize 0 or too small).
+func (h *Header) TensorBytes(fileSize uint64) (sizes map[string]int64, ok bool) {
+	sizes = make(map[string]int64, len(h.Tensors))
+	if len(h.Tensors) == 0 {
+		return sizes, true
+	}
+	idx := make([]int, len(h.Tensors))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(a, b int) bool { return h.Tensors[idx[a]].Offset < h.Tensors[idx[b]].Offset })
+	ok = true
+	for k, i := range idx {
+		t := h.Tensors[i]
+		var size uint64
+		if k+1 < len(idx) {
+			size = h.Tensors[idx[k+1]].Offset - t.Offset
+		} else if end := h.DataOffset + t.Offset; fileSize > end {
+			size = fileSize - end
+		} else {
+			ok = false
+		}
+		if size > math.MaxInt64/2 {
+			return map[string]int64{}, false
+		}
+		sizes[t.Name] = int64(size)
+	}
+	return sizes, ok
+}
+
 // CheckLayout is the pre-load sanity check on a whole local file: every tensor starts on the
 // alignment and lies inside the file.
 func (h *Header) CheckLayout(fileSize uint64) error {

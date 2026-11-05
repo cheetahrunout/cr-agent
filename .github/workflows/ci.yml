@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vet:
+    name: vet (four ways) and format
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        shell: bash
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "not formatted:"; echo "$out"; exit 1; fi
+      - name: go vet, release and debug, Windows and Linux
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go vet -tags debug ./...
+          GOOS=linux go vet ./...
+          GOOS=linux go vet -tags debug ./...
+
+  test:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go test (release build)
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+      - name: go test (debug build)
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 -tags debug ./...
+
+  guards:
+    name: release-build guards
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The release build talks to the production hub, downloads from Hugging Face and takes releases
+      # from the GitHub prefix, and to nothing else. (A grep of the binary for "localhost" proves
+      # nothing: the Go runtime itself contains that word.)
+      - name: host lists of the release build
+        shell: bash
+        run: |
+          go test -count=1 -run 'TestReleaseHubHosts' ./internal/link
+          go test -count=1 -run 'TestParseInputRelease' ./internal/pairing
+          go test -count=1 -run 'TestReleaseDownloadHosts' ./internal/hf
+          go test -count=1 -run 'TestReleaseSourceHosts' ./internal/updater
+          go test -count=1 -run 'TestStoredHubIsRevalidated' ./internal/agent
+      # The release build trusts only protocol/release-keys.json, never the throwaway test key, and
+      # does not start while that list is empty.
+      - name: trust list of the release build
+        shell: bash
+        run: go test -count=1 -run 'TestReleaseBuildTrust|TestCompiledInList|TestProductionRule' ./internal/trust
+      - name: a release build without a production key refuses to start
+        shell: pwsh
+        run: |
+          $keys = @((Get-Content protocol/release-keys.json -Raw | ConvertFrom-Json).keys).Count
+          go build -o "$env:RUNNER_TEMP\cragent.exe" ./cmd/cragent
+          go build -o "$env:RUNNER_TEMP\launcher.exe" ./cmd/launcher
+          if ($keys -eq 0) {
+            & "$env:RUNNER_TEMP\cragent.exe" --no-tray --home "$env:RUNNER_TEMP\home"
+            if ($LASTEXITCODE -ne 2) { throw "a release agent with an empty key list exited with $LASTEXITCODE, not 2" }
+            & "$env:RUNNER_TEMP\launcher.exe"
+            if ($LASTEXITCODE -ne 2) { throw "a release launcher with an empty key list exited with $LASTEXITCODE, not 2" }
+            "ok: no production key yet, and the release build refuses to start"
+          } else {
+            go run ./cmd/signtool trust-check
+            if ($LASTEXITCODE -ne 0) { throw "the production key list is not fit to ship" }
+          }
+      # The debug-only switches must not exist in a release build.
+      - name: the signing tool has no way to take a passphrase except the console
+        shell: bash
+        run: go test -count=1 -run 'TestNoPassphraseFlag' ./cmd/signtool
+      - name: the architecture list matches the pinned llama.cpp tag
+        shell: bash
+        run: |
+          cp supported_archs.txt "$RUNNER_TEMP/committed.txt"
+          go run ./tools/genarchs
+          diff -u "$RUNNER_TEMP/committed.txt" supported_archs.txt
+
+  minisign:
+    name: golden signature against the reference minisign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify the golden vector with minisign itself
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          pub=$(grep -oP 'ThrowawayPublicKey\s*=\s*"\K[^"]+' internal/sign/throwaway.go)
+          minisign -V -m internal/sign/testdata/golden-manifest.json -x internal/sign/testdata/golden-manifest.json.minisig -P "$pub"

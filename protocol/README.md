@@ -39,7 +39,8 @@ The design and the reasons are in the hub repository's `PLAN.md` (§10 and rulin
 
 Pairing is HTTP, not a frame: `POST /agent/pair {code, key_id, key_secret, prior_machine_id?}` → `200 {machine_id, slug}` or
 `202 {pending: true}` (poll every 3 s, up to 10 min) while the host chooses *Replace key* / *Pair as new* in the hub. The agent mints
-`key_id` (8 base32 chars) and the 256-bit secret; the hub mints `machine_id`. The WebSocket upgrade carries
+the machine key from its own random source: `key_id` is exactly 8 and the secret exactly 52 RFC 4648 base32 characters (A-Z, 2-7;
+260 bits). The hub mints `machine_id`. The WebSocket upgrade carries
 `Authorization: Bearer crm_<key_id>_<secret>`; the hub authenticates **before** the upgrade.
 
 Close codes: 4000 key not accepted (retry hourly and at start), 4001 upgrade required (major mismatch), 4002 replaced by a newer
@@ -51,6 +52,15 @@ socket, 4003 machine revoked (stop reconnecting).
 - Reconnect with full jitter: `random(0, min(30 s, 1 s × 2^n))`, reset after 60 s healthy; after a clean `going_away`/1012 close,
   0–3 s. Every connection starts with `hello` carrying the agent's full state; the hub rebuilds its view from it.
 - If the socket closes for any reason the agent aborts every local request in flight.
+
+## Progress and state changes
+
+- While a download moves bytes the agent sends one `status` frame a second with the job's `pct`, `bytes_done` and `bytes_total`,
+  and one more at once on every state change (a job starts, waits for a click, pauses, ends; the engine changes state).
+- `models[]` is in a `status` frame only when a model's state changed; a frame without it leaves the hub's list as it is.
+- A download waiting its turn (one runs at a time) is reported as `running` with 0 bytes done.
+- `hello` has no `engine_error`: when an engine error is pending at connect, the agent sends a `status` frame right after `welcome`.
+- `hf_token` travels only in `hello`: a token set or removed while connected reaches the hub at the next connection.
 
 ## Frames
 

@@ -13,12 +13,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cheetahrunout/cr-agent/internal/enginelock"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
 )
 
@@ -157,24 +157,9 @@ func (e *Engine) Stop() {
 	e.log.Info("engine stopped", "pid", e.p.PID(), "suppressed_lines", e.suppressed.Load(), "peak_job_mb", peak>>20)
 }
 
-// Engine output is filtered before it reaches the agent log (ruling B16): only lines matching this
-// allow-list are written, truncated; everything else is counted. The list is per pinned tag (b12125).
-var allowLines = []*regexp.Regexp{
-	regexp.MustCompile(`listening on http://127\.0\.0\.1:\d+$`),
-	regexp.MustCompile(`server_run_i: model loaded$`),
-	regexp.MustCompile(`(?i)\bcuda\b|ggml_cuda`),
-	regexp.MustCompile(`(?i)out of memory|failed to (load|allocate|initiali[sz]e)|error loading model|unable to load`),
-	regexp.MustCompile(`offloaded \d+/\d+ layers to GPU`),
-}
-
-func allowed(line string) bool {
-	for _, re := range allowLines {
-		if re.MatchString(line) {
-			return true
-		}
-	}
-	return false
-}
+// Engine output is filtered before it reaches the agent log (ruling B16): only lines matching the
+// allow-list of the pinned tag in engine.lock are written, truncated; everything else is counted.
+func allowed(line string) bool { return enginelock.Pinned().Allowed(line) }
 
 func (e *Engine) pump(r io.Reader) {
 	defer close(e.pumpDone)

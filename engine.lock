@@ -1,0 +1,23 @@
+{
+  "llama_tag": "b12125",
+  "commit": "7d516e25e",
+  "backend": "cuda-13.4",
+  "upstream": "https://github.com/ggml-org/llama.cpp/releases/download/b12125/",
+  "archives": [
+    {
+      "name": "llama-b12125-bin-win-cuda-13.4-x64.zip",
+      "sha256": "74e69c940f1c4a16703498ff68b4cb7992c59105c7c3244cac24f4053db4f88a"
+    },
+    {
+      "name": "cudart-llama-bin-win-cuda-13.4-x64.zip",
+      "sha256": "738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668"
+    }
+  ],
+  "stderr_allow": [
+    "listening on http://127\\.0\\.0\\.1:\\d+$",
+    "server_run_i: model loaded$",
+    "(?i)\\bcuda\\b|ggml_cuda",
+    "(?i)out of memory|failed to (load|allocate|initiali[sz]e)|error loading model|unable to load",
+    "offloaded \\d+/\\d+ layers to GPU"
+  ]
+}

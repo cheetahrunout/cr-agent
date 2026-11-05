@@ -5,13 +5,18 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/cheetahrunout/cr-agent/internal/fit"
 	"github.com/cheetahrunout/cr-agent/internal/link"
 	"github.com/cheetahrunout/cr-agent/internal/models"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
@@ -19,6 +24,7 @@ import (
 	"github.com/cheetahrunout/cr-agent/internal/status"
 	"github.com/cheetahrunout/cr-agent/internal/store"
 	"github.com/cheetahrunout/cr-agent/internal/supervisor"
+	"github.com/cheetahrunout/cr-agent/internal/updater"
 )
 
 // Engine is a running engine (supervisor.Engine, or a fake in tests).
@@ -34,11 +40,13 @@ type StartFunc func(ctx context.Context, c supervisor.Config) (Engine, error)
 
 // Config configures the agent.
 type Config struct {
-	Version   string
-	LlamaTag  string
-	EngineDir string
-	LowIL     bool
-	MemLimit  uint64
+	Version  string
+	LlamaTag string
+	// SupportedArchs is the architecture list of the pinned engine, reported in hello.
+	SupportedArchs []string
+	EngineDir      string
+	LowIL          bool
+	MemLimit       uint64
 	// LogicalCores bounds threads; n_layer and n_ctx_train come from each model's own header.
 	LogicalCores int
 	Log          *slog.Logger
@@ -62,9 +70,33 @@ type Config struct {
 	ResumedByHub func()
 	// TuneLink lets tests shorten the link's timings.
 	TuneLink func(*link.Config)
+	// GPUFree returns the free VRAM in bytes for the pre-load check (ruling B6); nil skips the check.
+	GPUFree func(ctx context.Context) (int64, error)
+	// KeepAwake is told whether Windows should be kept from sleeping on its own (§12.4); nil: never.
+	KeepAwake func(on bool)
+	// WakeCheck verifies an engine kept across a sleep (ruling B12); default: /health, then a
+	// one-token completion.
+	WakeCheck func(ctx context.Context, base, key, alias string) error
+	// Tick is how often the idle rules are checked (10 s); OfflineUnload is how long the hub may be
+	// unreachable before the model is unloaded (180 s, ruling B10); IdleUnit is the unit of
+	// idle_unload_min (a minute; tests shorten it).
+	Tick, OfflineUnload, IdleUnit time.Duration
+	// Updater installs a signed release (the update command); nil: this copy is not an installed one.
+	Updater Updater
+	// Restart is called after an update was installed: the process exits so the launcher starts the new version.
+	Restart func()
+	// RolledBack names, once, a version the launcher reverted before this start.
+	RolledBack func() string
+	// EngineCheck verifies the engine files against the signed release before they are run; nil: no check.
+	EngineCheck func() error
 	// CheckHub validates a hub URL read from the store; default link.ValidateHubURL (the build's host
 	// allowlist). Tests that run a local hub replace it.
 	CheckHub func(string) (string, error)
+}
+
+// Updater is the part of internal/updater the agent uses.
+type Updater interface {
+	Update(ctx context.Context, version string, progress updater.Progress) error
 }
 
 // Agent implements link.Handler.
@@ -73,23 +105,31 @@ type Agent struct {
 	log   *slog.Logger
 	relay *relay.Relay
 
-	mu          sync.Mutex
-	sess        *link.Session
-	mode        string
-	state       string
-	engine      Engine
-	loadedID    string
-	settings    *protocol.Settings
-	engineErr   string
-	lastDisc    string
-	loading     bool
-	stopping    bool
-	paused      bool
-	sleeping    bool
-	config      protocol.ConfigArgs
-	lowILResult string
-	cmdJobs     map[string]string             // download command id → model id
-	inspects    map[string]context.CancelFunc // inspect command id → cancel
+	mu           sync.Mutex
+	sess         *link.Session
+	mode         string
+	state        string
+	engine       Engine
+	loadedID     string
+	settings     *protocol.Settings
+	engineErr    string
+	lastDisc     string
+	loading      bool
+	stopping     bool
+	paused       bool
+	sleeping     bool
+	config       protocol.ConfigArgs
+	lowILResult  string
+	hubVersion   string
+	update       *protocol.UpdateStatus // set while an update runs or after one failed
+	updating     bool
+	attempts     int       // link connection attempts since Connect
+	lastOnline   time.Time // last moment the link was connected (or the engine was loaded)
+	lastActivity time.Time // last moment a request ran (or the engine was loaded)
+	stopTick     chan struct{}
+	tickOnce     sync.Once
+	cmdJobs      map[string]string             // download command id → model id
+	inspects     map[string]context.CancelFunc // inspect command id → cancel
 
 	linkMu     sync.Mutex
 	linkCancel context.CancelFunc
@@ -119,6 +159,18 @@ func New(cfg Config) *Agent {
 	if cfg.CheckHub == nil {
 		cfg.CheckHub = link.ValidateHubURL
 	}
+	if cfg.WakeCheck == nil {
+		cfg.WakeCheck = wakeCheck
+	}
+	if cfg.Tick <= 0 {
+		cfg.Tick = 10 * time.Second
+	}
+	if cfg.OfflineUnload <= 0 {
+		cfg.OfflineUnload = 180 * time.Second
+	}
+	if cfg.IdleUnit <= 0 {
+		cfg.IdleUnit = time.Minute
+	}
 	a := &Agent{cfg: cfg, log: cfg.Log, state: protocol.EngineUnloaded, mode: "normal",
 		cmdJobs: map[string]string{}, inspects: map[string]context.CancelFunc{}}
 	a.relay = relay.New(a.target, cfg.Log)
@@ -137,7 +189,118 @@ func New(cfg Config) *Agent {
 	if a.paused && cfg.Models != nil {
 		cfg.Models.SetPaused(true)
 	}
+	a.stopTick = make(chan struct{})
+	go func() {
+		t := time.NewTicker(cfg.Tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-a.stopTick:
+				return
+			case now := <-t.C:
+				a.tick(now)
+			}
+		}
+	}()
 	return a
+}
+
+// tick applies the local idle rules (ruling B10), so a dead hub or a forgotten model never holds the
+// host's VRAM: unload when the hub has been unreachable for more than 180 s, or after
+// idle_unload_min without a request.
+func (a *Agent) tick(now time.Time) {
+	a.linkMu.Lock()
+	phase := a.phase
+	a.linkMu.Unlock()
+	inflight := len(a.relay.Inflight())
+	a.mu.Lock()
+	if phase == link.PhaseConnected || a.lastOnline.IsZero() {
+		a.lastOnline = now
+	}
+	if inflight > 0 || a.lastActivity.IsZero() {
+		a.lastActivity = now
+	}
+	loaded := a.state == protocol.EngineLoaded && a.engine != nil && !a.sleeping
+	idleMin := 0
+	if a.config.IdleUnloadMin != nil {
+		idleMin = *a.config.IdleUnloadMin
+	}
+	offline, idle := now.Sub(a.lastOnline), now.Sub(a.lastActivity)
+	a.mu.Unlock()
+	if loaded {
+		switch {
+		case offline > a.cfg.OfflineUnload:
+			a.log.Warn("unloading the model: the hub has been unreachable too long", "offline_s", int(offline.Seconds()))
+			a.Unload()
+		case idleMin > 0 && inflight == 0 && idle > time.Duration(idleMin)*a.cfg.IdleUnit:
+			a.log.Info("unloading the model: no request for the idle time", "idle_unload_min", idleMin)
+			a.Unload()
+		}
+	}
+	a.updateAwake()
+}
+
+// updateAwake keeps Windows from sleeping on its own while a request, a load or a download runs,
+// and, when the host switched keep_awake on, for as long as a model is loaded (§12.4).
+func (a *Agent) updateAwake() {
+	if a.cfg.KeepAwake == nil {
+		return
+	}
+	_, jobs := a.localModels()
+	downloading := false
+	for _, j := range jobs {
+		if j.Kind == "download" && j.State == "running" {
+			downloading = true
+		}
+	}
+	inflight := len(a.relay.Inflight())
+	a.mu.Lock()
+	keep := a.config.KeepAwake != nil && *a.config.KeepAwake
+	want := !a.sleeping && (inflight > 0 || a.loading || downloading || (keep && a.state == protocol.EngineLoaded))
+	a.mu.Unlock()
+	a.cfg.KeepAwake(want)
+}
+
+// wakeCheck is the default check of an engine kept across a sleep: /health, then one token.
+func wakeCheck(ctx context.Context, base, key, alias string) error {
+	c := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 20 * time.Second}
+	do := func(method, path, body string) error {
+		req, err := http.NewRequestWithContext(ctx, method, base+path, strings.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := c.Do(req)
+		if err != nil {
+			return errors.New(path + " did not answer")
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%s answered HTTP %d", path, resp.StatusCode)
+		}
+		return nil
+	}
+	var err error
+	for i := 0; i < 10; i++ { // the GPU may need a moment after the wake
+		if err = do(http.MethodGet, "/health", ""); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(map[string]any{"model": alias, "max_tokens": 1, "stream": false,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	return do(http.MethodPost, "/v1/chat/completions", string(b))
 }
 
 // Relay exposes the relay (tests).
@@ -185,7 +348,7 @@ func (a *Agent) Hello() *protocol.Hello {
 		Platform:             runtime.GOOS + "-" + runtime.GOARCH,
 		Backend:              "cuda",
 		Capabilities:         a.capabilities(),
-		SupportedArchs:       []string{},
+		SupportedArchs:       append([]string{}, a.cfg.SupportedArchs...),
 		LlamaTag:             a.cfg.LlamaTag,
 		Hardware:             hwr,
 		Engine:               a.state,
@@ -210,7 +373,18 @@ func (a *Agent) OnWelcome(s *link.Session, w *protocol.Welcome) {
 	a.mu.Lock()
 	a.sess = s
 	a.mode = w.Mode
+	a.hubVersion = w.HubVersion
+	pendingError := a.engineErr != ""
+	if a.cfg.RolledBack != nil && a.update == nil {
+		if v := a.cfg.RolledBack(); v != "" { // the launcher reverted an update: tell the hub once
+			a.update = &protocol.UpdateStatus{State: "failed", Version: v}
+			pendingError = true
+		}
+	}
 	a.mu.Unlock()
+	if pendingError { // hello has no engine_error and no update state: a status frame carries them
+		a.sendStatus(false)
+	}
 	a.cfg.OnChange()
 }
 
@@ -246,7 +420,11 @@ func (a *Agent) OnFrame(s *link.Session, f protocol.Frame) {
 		case paused:
 			a.relay.Refuse(s, f.ID, 503, "machine_paused", "the host paused this PC")
 		default:
+			a.mu.Lock()
+			a.lastActivity = time.Now()
+			a.mu.Unlock()
 			a.relay.Handle(s, f)
+			a.updateAwake()
 			a.cfg.OnChange()
 		}
 	case *protocol.Cancel:
@@ -410,9 +588,88 @@ func (a *Agent) handleCmd(s *link.Session, c *protocol.Cmd) {
 		a.cancelID(args.ID)
 		_ = s.Send(&protocol.CmdDone{ID: c.ID})
 
-	default: // update: the updater is a later slice
+	case *protocol.UpdateArgs:
+		a.cmdUpdate(s, c.ID, args.Version)
+
+	default:
 		a.cmdErr(s, c.ID, protocol.ErrUnsupported, "", "not in this version")
 	}
+}
+
+// cmdUpdate runs update{version} (ruling B23). The hub names only the version; the updater builds
+// every URL itself and verifies the signed manifest before it fetches anything else.
+func (a *Agent) cmdUpdate(s *link.Session, id, version string) {
+	if a.cfg.Updater == nil {
+		a.cmdErr(s, id, protocol.ErrUnsupported, "", "this copy of the agent was not installed by the installer")
+		return
+	}
+	a.mu.Lock()
+	if a.updating {
+		a.mu.Unlock()
+		a.cmdErr(s, id, protocol.ErrBusy, "", "an update is already running")
+		return
+	}
+	a.updating = true
+	a.mu.Unlock()
+	_ = s.Send(&protocol.CmdAck{ID: id})
+	lastState, lastPct := "", -1.0
+	progress := func(state string, pct float64) {
+		whole := float64(int(pct))
+		if state == lastState && whole == lastPct {
+			return
+		}
+		lastState, lastPct = state, whole
+		a.mu.Lock()
+		a.update = &protocol.UpdateStatus{State: state, Pct: &whole, Version: version}
+		a.mu.Unlock()
+		a.sendStatus(false)
+	}
+	// The update goes on if the socket drops: it is the agent's own job, like a download.
+	err := a.cfg.Updater.Update(context.Background(), version, progress)
+	a.mu.Lock()
+	a.updating = false
+	var ue *updater.Error
+	switch {
+	case err == nil:
+	case errors.Is(err, updater.ErrAlreadyInstalled):
+		a.update = nil
+	default:
+		a.update = &protocol.UpdateStatus{State: "failed", Version: version}
+	}
+	a.mu.Unlock()
+	switch {
+	case err == nil:
+		a.log.Info("update installed", "version", version)
+		_ = s.Send(&protocol.CmdDone{ID: id, Result: map[string]any{"version": version, "restarting": true}})
+		if a.cfg.Restart != nil {
+			a.cfg.Restart()
+		}
+	case errors.Is(err, updater.ErrAlreadyInstalled):
+		a.sendStatus(false)
+		_ = s.Send(&protocol.CmdDone{ID: id, Result: map[string]any{"version": version, "already_installed": true}})
+	case errors.As(err, &ue):
+		a.log.Warn("update refused", "version", version, "code", ue.Code, "why", ue.Msg)
+		a.sendStatus(false)
+		a.cmdErr(s, id, ue.Code, "", ue.Msg)
+	default:
+		a.log.Warn("update failed", "version", version, "err", err.Error())
+		a.sendStatus(false)
+		a.cmdErr(s, id, protocol.ErrUpdateFailed, "", "the update failed")
+	}
+}
+
+// HubVersion is the hub's version from the last welcome.
+func (a *Agent) HubVersion() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hubVersion
+}
+
+// LinkAttempts counts the connection attempts since Connect (the launcher's health gate, ruling B22).
+func (a *Agent) LinkAttempts() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.attempts
 }
 
 func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, paused bool) {
@@ -444,6 +701,9 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 			a.cmdErr(s, id, protocol.ErrBadSetting, fe.Field, fe.Msg)
 			return
 		}
+		if refused := a.checkVRAM(s, id, l, args.Settings); refused {
+			return
+		}
 	default:
 		a.cmdErr(s, id, protocol.ErrNotFound, "model_id", "model not on this PC")
 		return
@@ -459,6 +719,43 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		return
 	}
 	_ = s.Send(&protocol.CmdDone{ID: id, Result: res})
+}
+
+// checkVRAM is the pre-load check of ruling B6: the estimate for these settings, from the model's own
+// header, must fit in the free VRAM minus 0.5 GiB. Nothing is adjusted: a load that does not fit is
+// refused with the numbers. It reports whether the load was refused.
+func (a *Agent) checkVRAM(s *link.Session, id string, l *models.Loadable, st protocol.Settings) bool {
+	if a.cfg.GPUFree == nil {
+		return false
+	}
+	sizes, ok := l.Header.TensorBytes(uint64(l.Size))
+	if !ok {
+		return false
+	}
+	est := fit.For(l.Header, sizes, st)
+	if est.Total() == 0 {
+		return false // nothing goes to the GPU
+	}
+	// A model that is loaded now will be replaced by this load: free its memory before measuring.
+	a.mu.Lock()
+	loaded := a.engine != nil
+	a.mu.Unlock()
+	if loaded {
+		a.Unload()
+	}
+	free, err := a.cfg.GPUFree(s.Context())
+	if err != nil {
+		a.log.Warn("free VRAM unknown; loading without the pre-load check", "err", err.Error())
+		return false
+	}
+	need, freeMB, fits := fit.Check(est, free)
+	a.log.Info("pre-load check", "need_mb", need, "free_mb", freeMB, "gpu_blocks", est.GPUBlocks, "fits", fits)
+	if fits {
+		return false
+	}
+	_ = s.Send(&protocol.CmdErr{ID: id, Code: protocol.ErrInsufficientVRAM, NeedMB: &need, FreeMB: &freeMB,
+		Message: "not enough free GPU memory for these settings"})
+	return true
 }
 
 var errBusy = errors.New("a load is already running, or the PC is paused or asleep")
@@ -486,6 +783,16 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 	// The load continues even if the socket drops (long jobs are agent-owned, ruling B3).
 	lctx := context.WithoutCancel(ctx)
 
+	if a.cfg.EngineCheck != nil {
+		if err := a.cfg.EngineCheck(); err != nil { // the engine files are not the signed ones: never run them
+			a.mu.Lock()
+			a.state, a.engineErr, a.settings, a.loadedID = protocol.EngineError, "engine_files_changed", nil, ""
+			a.mu.Unlock()
+			a.log.Error("load refused: the engine files do not match the signed release", "err", err.Error())
+			a.sendStatus(false)
+			return nil, err
+		}
+	}
 	sc := supervisor.Config{EngineDir: a.cfg.EngineDir, ModelPath: path, Alias: modelID,
 		Settings: st, LowIL: a.cfg.LowIL, MemLimit: a.cfg.MemLimit, Log: a.log}
 	t0 := time.Now()
@@ -531,6 +838,7 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 		return nil, err
 	}
 	a.engine, a.state = eng, protocol.EngineLoaded
+	a.lastActivity, a.lastOnline = time.Now(), time.Now() // both idle clocks start at the load
 	a.mu.Unlock()
 	res := map[string]any{"start_ms": ms, "low_il": lowIL}
 	if a.cfg.GPUInUse != nil && wantGPU {
@@ -652,7 +960,7 @@ func (a *Agent) sendStatus(withModels bool) {
 	ms, jobs := a.localModels()
 	a.mu.Lock()
 	s := a.sess
-	st := &protocol.Status{Engine: a.state, EngineError: a.engineErr, Jobs: jobs, SettingsInUse: a.settings, LocalPause: a.paused}
+	st := &protocol.Status{Engine: a.state, EngineError: a.engineErr, Jobs: jobs, SettingsInUse: a.settings, LocalPause: a.paused, Update: a.update}
 	if withModels {
 		st.Models = ms
 	}
@@ -663,6 +971,7 @@ func (a *Agent) sendStatus(withModels bool) {
 	if s != nil {
 		_ = s.Send(st)
 	}
+	a.updateAwake()
 	a.cfg.OnChange()
 }
 
@@ -698,6 +1007,11 @@ func (a *Agent) Connect(hub, key string) {
 			a.phase = p
 		}
 		a.linkMu.Unlock()
+		if p == link.PhaseConnecting {
+			a.mu.Lock()
+			a.attempts++
+			a.mu.Unlock()
+		}
 		a.cfg.OnChange()
 	}}
 	if a.cfg.TuneLink != nil {
@@ -726,8 +1040,8 @@ func (a *Agent) Disconnect() {
 }
 
 // Suspend is called when Windows is about to sleep (ruling B12): abort the answers in flight, say
-// status{sleeping}, close the link with 1001, and stop the engine so nothing holds the GPU across
-// the sleep. It returns within about two seconds, the time Windows grants.
+// status{sleeping}, and close the link with 1001. The engine is kept; Resume checks it before it is
+// reported as loaded again. Suspend returns within about a second, inside the time Windows grants.
 func (a *Agent) Suspend() {
 	a.mu.Lock()
 	if a.sleeping {
@@ -736,44 +1050,32 @@ func (a *Agent) Suspend() {
 	}
 	a.sleeping = true
 	s := a.sess
-	e := a.engine
-	a.engine, a.state, a.settings, a.loadedID, a.engineErr = nil, protocol.EngineUnloaded, nil, "", ""
-	paused := a.paused
+	st := &protocol.Status{Engine: a.state, EngineError: a.engineErr, SettingsInUse: a.settings, LocalPause: a.paused}
+	if a.state == protocol.EngineLoaded || a.state == protocol.EngineLoading {
+		st.ModelID = a.loadedID
+	}
 	a.mu.Unlock()
 	a.log.Info("suspending")
 	a.relay.CancelAll()
 	if s != nil {
 		t := true
-		_, jobs := a.localModels()
-		_ = s.Send(&protocol.Status{Engine: protocol.EngineUnloaded, Jobs: jobs, LocalPause: paused, Sleeping: &t})
+		_, st.Jobs = a.localModels()
+		st.Sleeping = &t
+		_ = s.Send(st)
 		s.Close(1001, "sleep")
-	}
-	a.linkMu.Lock()
-	done := a.linkDone
-	a.linkMu.Unlock()
-	stopped := make(chan struct{})
-	go func() {
-		if e != nil {
-			a.stopEngine(e)
-		}
-		close(stopped)
-	}()
-	if done != nil && s != nil { // give the close frame a moment to leave before the link is torn down
-		select {
+		select { // give the close frame a moment to leave before the link is torn down
 		case <-s.Context().Done():
 		case <-time.After(700 * time.Millisecond):
 		}
 	}
 	a.Disconnect()
-	select {
-	case <-stopped:
-	case <-time.After(time.Second):
-	}
+	a.updateAwake()
 	a.cfg.OnChange()
 }
 
-// Resume is called when Windows wakes: reconnect at once, without backoff, and report the real
-// state in hello. The model is not reloaded: the hub decides what to load.
+// Resume is called when Windows wakes: reconnect at once, without backoff, with the real state in
+// hello. An engine kept across the sleep shows as loading until /health and a one-token completion
+// have passed; if either fails the engine is stopped and reported unloaded with the reason.
 func (a *Agent) Resume() {
 	a.mu.Lock()
 	if !a.sleeping {
@@ -781,8 +1083,18 @@ func (a *Agent) Resume() {
 		return
 	}
 	a.sleeping = false
+	now := time.Now() // the clocks jumped: both idle rules start again
+	a.lastOnline, a.lastActivity = now, now
+	e := a.engine
+	verify := e != nil && a.state == protocol.EngineLoaded
+	if verify {
+		a.state = protocol.EngineLoading
+	}
 	a.mu.Unlock()
-	a.log.Info("resumed from sleep")
+	a.log.Info("resumed from sleep", "engine_kept", verify)
+	if verify {
+		go a.verifyAfterWake(e)
+	}
 	a.linkMu.Lock()
 	hub, key := a.linkHub, a.linkKey
 	a.linkMu.Unlock()
@@ -791,8 +1103,37 @@ func (a *Agent) Resume() {
 	}
 }
 
+func (a *Agent) verifyAfterWake(e Engine) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	base, key, alias := e.Target()
+	t0 := time.Now()
+	err := a.cfg.WakeCheck(ctx, base, key, alias)
+	a.mu.Lock()
+	if a.engine != e || a.state != protocol.EngineLoading { // replaced or unloaded meanwhile
+		a.mu.Unlock()
+		return
+	}
+	if err == nil {
+		a.state = protocol.EngineLoaded
+		a.mu.Unlock()
+		a.log.Info("engine passed the check after sleep", "ms", time.Since(t0).Milliseconds())
+		a.sendStatus(false)
+		return
+	}
+	a.engine, a.state, a.settings, a.loadedID, a.engineErr = nil, protocol.EngineUnloaded, nil, "", "sleep_check_failed"
+	a.mu.Unlock()
+	a.log.Error("engine failed the check after sleep; stopping it", "err", err.Error())
+	a.stopEngine(e)
+	a.sendStatus(false)
+}
+
 // Shutdown stops the link and the engine.
 func (a *Agent) Shutdown() {
+	a.tickOnce.Do(func() { close(a.stopTick) })
 	a.Disconnect()
 	a.Unload()
+	if a.cfg.KeepAwake != nil {
+		a.cfg.KeepAwake(false)
+	}
 }

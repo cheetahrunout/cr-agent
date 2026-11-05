@@ -5,7 +5,9 @@ go 1.24.13
 require (
 	github.com/coder/websocket v1.8.14
 	github.com/ncruces/zenity v0.10.14
+	golang.org/x/crypto v0.41.0
 	golang.org/x/sys v0.35.0
+	golang.org/x/text v0.28.0
 )
 
 require (

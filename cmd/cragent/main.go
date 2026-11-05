@@ -18,8 +18,11 @@ import (
 
 	"github.com/cheetahrunout/cr-agent/internal/agent"
 	"github.com/cheetahrunout/cr-agent/internal/approve"
+	"github.com/cheetahrunout/cr-agent/internal/enginelock"
 	"github.com/cheetahrunout/cr-agent/internal/hf"
 	"github.com/cheetahrunout/cr-agent/internal/hw"
+	"github.com/cheetahrunout/cr-agent/internal/keepawake"
+	"github.com/cheetahrunout/cr-agent/internal/layout"
 	"github.com/cheetahrunout/cr-agent/internal/link"
 	"github.com/cheetahrunout/cr-agent/internal/models"
 	"github.com/cheetahrunout/cr-agent/internal/pairing"
@@ -29,14 +32,20 @@ import (
 	"github.com/cheetahrunout/cr-agent/internal/store"
 	"github.com/cheetahrunout/cr-agent/internal/supervisor"
 	"github.com/cheetahrunout/cr-agent/internal/tray"
+	"github.com/cheetahrunout/cr-agent/internal/trust"
 	"github.com/cheetahrunout/cr-agent/internal/ui"
+	"github.com/cheetahrunout/cr-agent/internal/updater"
 )
 
 // version is set by the release build (-ldflags "-X main.version=...").
 var version = "0.1.0"
 
-// llamaTag is the pinned llama.cpp build (engine.lock in later milestones).
-const llamaTag = "b12125"
+// sabotage is set only in the dry run's deliberately broken build (-X main.sabotage=unhealthy):
+// a debug agent that never passes the health gate, so the launcher has something to revert.
+var sabotage string
+
+// llamaTag is the pinned llama.cpp build, from engine.lock.
+var llamaTag = enginelock.Pinned().Tag
 
 func main() { os.Exit(run()) }
 
@@ -48,8 +57,8 @@ func env(name, def string) string {
 }
 
 type options struct {
-	home, hub, key, engine, model, modelID, modelsDir, pair, hfBase, approve string
-	load, lowIL, noMemCap, noTray, unpair, verbose                           bool
+	home, hub, key, engine, model, modelID, modelsDir, pair, hfBase, approve, releaseBase string
+	load, lowIL, noMemCap, noTray, unpair, verbose                                        bool
 }
 
 func parseFlags() options {
@@ -70,6 +79,7 @@ func parseFlags() options {
 	flag.StringVar(&o.modelID, "model-id", "", "development: model id for --model (default: from the file name)")
 	flag.BoolVar(&o.load, "load", false, "development: load --model at start")
 	flag.StringVar(&o.hfBase, "hf-base", "", "debug builds only: a local stand-in for huggingface.co")
+	flag.StringVar(&o.releaseBase, "release-base", "", "debug builds only: a local stand-in for the GitHub release downloads")
 	flag.StringVar(&o.approve, "approve", "ask", "debug builds only: ask | allow | deny for downloads outside the publisher allowlist")
 	flag.Parse()
 	if o.key == "" {
@@ -96,11 +106,26 @@ type app struct {
 	hfState  hf.TokenState
 	devKeyed bool
 	refresh  chan struct{}
+
+	root    string // the install folder, when this agent runs from one
+	managed bool
+	up      *updater.Updater
+	trayUp  atomic.Bool
+	quit    chan struct{}
+	code    int
 }
 
 func run() int {
 	o := parseFlags()
+	// An installed agent lives in <root>\versions\<version>\ beside the launcher's current.json.
+	root, layoutVersion, managed := "", "", false
+	if exe, err := os.Executable(); err == nil {
+		root, layoutVersion, managed = layout.Find(exe)
+	}
 	home := o.home
+	if home == "" && managed {
+		home = root
+	}
 	if home == "" {
 		var err error
 		if home, err = store.DefaultDir(); err != nil {
@@ -124,8 +149,12 @@ func run() int {
 	log := slog.New(slog.NewJSONHandler(logWriter{logFile}, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
 
-	if !debugBuild && (o.approve != "ask" || o.hfBase != "") {
-		log.Error("--approve and --hf-base exist only in debug builds")
+	if !debugBuild && (o.approve != "ask" || o.hfBase != "" || o.releaseBase != "") {
+		log.Error("--approve, --hf-base and --release-base exist only in debug builds")
+		return 2
+	}
+	if managed && layoutVersion != version {
+		log.Error("this agent is not the version its folder is named for", "folder", layoutVersion, "agent", version)
 		return 2
 	}
 	defaultHub, err := link.ValidateHubURL(o.hub)
@@ -145,6 +174,13 @@ func run() int {
 		log.Error("machine key malformed (want crm_<8 base32>_<52 base32>)")
 		return 2
 	}
+	// A release build runs only with a production signing key compiled in (ruling B20): without one
+	// it could never verify an update, and with the test key anyone could sign one.
+	if err := trust.Check(); err != nil {
+		log.Error("this build cannot run", "err", err.Error())
+		fmt.Fprintln(os.Stderr, "cragent:", err)
+		return 2
+	}
 	release, running := singleInstance(st.Dir())
 	if running {
 		log.Error("another CR agent is already running with this folder")
@@ -152,7 +188,8 @@ func run() int {
 	}
 	defer release()
 
-	ap := &app{o: o, log: log, st: st, defaultHub: defaultHub, refresh: make(chan struct{}, 1), hfState: hf.TokenAbsent}
+	ap := &app{o: o, log: log, st: st, defaultHub: defaultHub, refresh: make(chan struct{}, 1), hfState: hf.TokenAbsent,
+		root: root, managed: managed, quit: make(chan struct{}, 1)}
 	if err := ap.start(); err != nil {
 		log.Error("start failed", "err", err.Error())
 		return 1
@@ -163,6 +200,11 @@ func run() int {
 		if slug, err := ap.pair(o.pair, func() { log.Info("this PC was paired before: choose Replace key or a new name in the hub") }); err != nil {
 			log.Error("pairing failed", "why", pairingMessage(err))
 			fmt.Fprintln(os.Stderr, pairingMessage(err))
+			// A PC that is already paired stays connected with the key it has (a code on the command
+			// line is used once; a later start with the same line must not leave the PC offline).
+			if ap.a.ConnectStored() {
+				log.Info("using the pairing this PC already has")
+			}
 		} else {
 			fmt.Fprintln(os.Stderr, "Paired as "+slug+".")
 		}
@@ -172,21 +214,81 @@ func run() int {
 		ready := make(chan struct{})
 		go func() {
 			<-ready
+			ap.trayUp.Store(true)
 			ap.requestRefresh()
 		}()
 		go ap.signalQuit()
 		err := ap.tr.Run(ready)
 		if err == nil {
-			log.Info("stopped")
-			return 0
+			return ap.exitCode()
 		}
 		log.Warn("no tray available; running as a console program", "err", err.Error())
 	}
+	ap.trayUp.Store(true) // console mode: there is no tray to wait for
 	ctx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stopSig()
-	<-ctx.Done()
-	log.Info("stopped")
-	return 0
+	select {
+	case <-ctx.Done():
+	case <-ap.quit:
+	}
+	return ap.exitCode()
+}
+
+// exit ends the agent with an exit code: 75 asks the launcher to start the version its pointer names.
+func (ap *app) exit(code int) {
+	ap.mu.Lock()
+	ap.code = code
+	ap.mu.Unlock()
+	select {
+	case ap.quit <- struct{}{}:
+	default:
+	}
+	ap.tr.Close()
+}
+
+func (ap *app) exitCode() int {
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	ap.log.Info("stopped", "exit_code", ap.code)
+	return ap.code
+}
+
+// healthGate decides when this agent is healthy (ruling B22): it verified its files (Startup passed),
+// its tray is up, and it reached welcome or made three connection attempts. It then writes
+// healthy.<version>, which the launcher waits for, and commits the release.
+func (ap *app) healthGate() {
+	if debugBuild && sabotage == "unhealthy" {
+		ap.log.Warn("this build is deliberately unhealthy: it never passes the health gate")
+		return
+	}
+	for {
+		time.Sleep(250 * time.Millisecond)
+		paired := ap.paired()
+		in := ap.a.Snapshot(paired)
+		if ap.trayUp.Load() && (!paired || in.Link == link.PhaseConnected || ap.a.LinkAttempts() > 3) {
+			if err := ap.up.MarkHealthy(); err != nil {
+				ap.log.Error("health mark not written", "err", err.Error())
+			} else {
+				ap.log.Info("healthy", "version", version, "connected", in.Link == link.PhaseConnected)
+			}
+			return
+		}
+	}
+}
+
+// bootstrap fetches and checks the manifest of a freshly installed version (the installer cannot
+// carry the manifest that lists the installer itself).
+func (ap *app) bootstrap() {
+	for try := 0; try < 3; try++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := ap.up.Bootstrap(ctx)
+		cancel()
+		if err == nil {
+			return
+		}
+		ap.log.Warn("the manifest of this version could not be fetched and checked yet", "err", err.Error())
+		time.Sleep(time.Minute)
+	}
 }
 
 func (ap *app) signalQuit() {
@@ -258,7 +360,7 @@ func (ap *app) start() error {
 	}
 
 	cfg := agent.Config{
-		Version: version, LlamaTag: llamaTag, EngineDir: o.engine, LowIL: o.lowIL, MemLimit: memCap, LogicalCores: sys.Logical,
+		Version: version, LlamaTag: llamaTag, SupportedArchs: enginelock.Pinned().Archs(), EngineDir: o.engine, LowIL: o.lowIL, MemLimit: memCap, LogicalCores: sys.Logical,
 		Log: log, Models: ap.mm, Store: st,
 		Hardware: func(ctx context.Context) protocol.Hardware {
 			h, err := hw.Report(ctx, ap.mm.Dir())
@@ -276,6 +378,14 @@ func (ap *app) start() error {
 			defer ap.mu.Unlock()
 			return string(ap.hfState)
 		},
+		GPUFree: func(ctx context.Context) (int64, error) {
+			index := -1 // all GPUs
+			if sel := st.Config().GPUSelect; len(sel) == 1 && sel[0] >= '0' && sel[0] <= '7' {
+				index = int(sel[0] - '0')
+			}
+			return hw.GPUFree(ctx, index)
+		},
+		KeepAwake:    keepawake.New().Set,
 		OnChange:     ap.requestRefresh,
 		ResumedByHub: func() { ap.tr.Notify("Hosting resumed", "Sharing on this PC was resumed from the hub.") },
 	}
@@ -295,8 +405,39 @@ func (ap *app) start() error {
 			return errors.New("model id invalid")
 		}
 	}
+	if ap.managed {
+		up, err := updater.New(updater.Config{Root: ap.root, Version: version, Store: st, Keys: trust.Keys(), Base: o.releaseBase, Log: log,
+			HubVersion: func() string {
+				if a := ap.aRef.Load(); a != nil {
+					return a.HubVersion()
+				}
+				return ""
+			},
+			StopEngine: func() {
+				if a := ap.aRef.Load(); a != nil {
+					a.Unload()
+				}
+			}})
+		if err != nil {
+			return err
+		}
+		// The signature of the installed release and the agent's own files, at every start (ruling B21).
+		if err := up.Startup(); err != nil {
+			return fmt.Errorf("install check: %w", err)
+		}
+		ap.up = up
+		cfg.Updater, cfg.RolledBack, cfg.EngineCheck = up, up.RolledBack, up.VerifyEngine
+		cfg.Restart = func() { ap.exit(layout.ExitRestart) }
+		if cfg.EngineDir == "" {
+			cfg.EngineDir = layout.EngineDir(ap.root, llamaTag)
+		}
+	}
 	ap.a = agent.New(cfg)
 	ap.aRef.Store(ap.a)
+	if ap.up != nil {
+		go ap.bootstrap()
+		go ap.healthGate()
+	}
 	go ap.refreshLoop()
 	go ap.checkToken()
 

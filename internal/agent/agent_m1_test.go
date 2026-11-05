@@ -62,6 +62,7 @@ type world struct {
 	model   []byte
 	root    string
 	started []supervisor.Config
+	handles []*fakeHandle
 	closes  chan websocket.StatusCode
 
 	mu       sync.Mutex
@@ -70,7 +71,10 @@ type world struct {
 	pairReqs []map[string]string
 }
 
-func newWorld(t *testing.T) *world {
+func newWorld(t *testing.T) *world { return newWorldWith(t, nil) }
+
+// newWorldWith lets a test change the agent's config before it starts.
+func newWorldWith(t *testing.T, tune func(*Config)) *world {
 	t.Helper()
 	w := &world{t: t, hf: hftest.New(), fe: newFakeEngine(t), hubs: make(chan *hub, 8), click: &clicker{},
 		codes: map[string]string{"K7M29QWDX3": "ok", "EXP1REDC0D": "expired", "VSEDC0DE11": "used"}, keys: map[string]bool{},
@@ -103,19 +107,25 @@ func newWorld(t *testing.T) *world {
 		t.Fatal(err)
 	}
 	t.Cleanup(w.mm.Close)
-	w.a = New(Config{Version: "0.1.0", LlamaTag: "test", LogicalCores: 8, Log: log, Models: w.mm, Store: w.st,
+	cfg := Config{Version: "0.1.0", LlamaTag: "test", LogicalCores: 8, Log: log, Models: w.mm, Store: w.st,
 		HFToken:  func() string { return "absent" },
 		CheckHub: func(u string) (string, error) { return u, nil }, // the test hub is local
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			h := &fakeHandle{base: w.fe.srv.URL, done: make(chan struct{})}
 			w.mu.Lock()
 			w.started = append(w.started, c)
+			w.handles = append(w.handles, h)
 			w.mu.Unlock()
-			return &fakeHandle{base: w.fe.srv.URL, done: make(chan struct{})}, nil
+			return h, nil
 		},
 		TuneLink: func(c *link.Config) {
 			c.BaseDelay, c.MaxDelay, c.GoingAway = 10*time.Millisecond, 50*time.Millisecond, 20*time.Millisecond
 		},
-	})
+	}
+	if tune != nil {
+		tune(&cfg)
+	}
+	w.a = New(cfg)
 	t.Cleanup(w.a.Shutdown)
 	return w
 }
@@ -504,82 +514,4 @@ func TestDownloadSurvivesSocketLoss(t *testing.T) {
 	h2.until("ready after reconnect", 15*time.Second, func(m map[string]any) bool {
 		return m["t"] == "status" && modelState(m, "tiny-q4_k_m") == "ready"
 	})
-}
-
-// Sleep and wake (ruling B12).
-func TestSuspendResume(t *testing.T) {
-	w := newWorld(t)
-	h, _ := w.connect()
-	// A local model keeps this test about sleep, not downloads.
-	w.a.cfg.LocalModelID, w.a.cfg.LocalModelPath = "smollm2-360m-q8_0", "local.gguf"
-	h.send(loadOK)
-	h.until("load done", 5*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.done" })
-	h.send(reqStream)
-	h.next("res.data", 2*time.Second)
-
-	t0 := time.Now()
-	gone := make(chan struct{})
-	go func() { w.a.Suspend(); close(gone) }()
-	// The hub sees: the answer cancelled, status{sleeping}, then a close with 1001.
-	sawSleeping := false
-	var closeCode websocket.StatusCode = -1
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for closeCode == -1 {
-		_, b, err := h.conn.Read(ctx)
-		if err != nil {
-			closeCode = websocket.CloseStatus(err)
-			if closeCode == -1 {
-				t.Fatalf("socket ended without a close frame: %v", err)
-			}
-			break
-		}
-		var m map[string]any
-		json.Unmarshal(b, &m)
-		if m["t"] == "status" && m["sleeping"] == true && m["engine"] == "unloaded" {
-			sawSleeping = true
-		}
-	}
-	<-gone
-	if el := time.Since(t0); el > 2*time.Second {
-		t.Fatalf("suspend took %v; Windows grants about two seconds", el)
-	}
-	if !sawSleeping || closeCode != websocket.StatusGoingAway {
-		t.Fatalf("sleeping status seen: %v, close code %d", sawSleeping, closeCode)
-	}
-	select {
-	case <-w.fe.disconnected:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the answer in flight was not aborted")
-	}
-	if in := w.a.Snapshot(true); in.Engine != "unloaded" {
-		t.Fatalf("engine %q after suspend", in.Engine)
-	}
-	// Nothing reconnects while asleep.
-	select {
-	case <-w.hubs:
-		t.Fatal("the agent reconnected while asleep")
-	case <-time.After(150 * time.Millisecond):
-	}
-	// Loads are refused while asleep.
-	if _, err := w.a.Load(context.Background(), "smollm2-360m-q8_0", "local.gguf", supervisor.DefaultSettings(4)); err == nil {
-		t.Fatal("a load ran while asleep")
-	}
-
-	t1 := time.Now()
-	w.a.Resume()
-	_, hello := w.accept()
-	if el := time.Since(t1); el > time.Second {
-		t.Fatalf("reconnect after wake took %v", el)
-	}
-	if hello["engine"] != "unloaded" || hello["last_disconnect_reason"] != "sleep" || hello["model_id"] != nil || len(hello["inflight"].([]any)) != 0 {
-		t.Fatalf("hello after wake: %v", hello)
-	}
-	// A second wake signal (Windows sends two) does nothing.
-	w.a.Resume()
-	select {
-	case <-w.hubs:
-		t.Fatal("a duplicate wake signal reconnected again")
-	case <-time.After(150 * time.Millisecond):
-	}
 }

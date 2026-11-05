@@ -1,6 +1,8 @@
 //go:build windows
 
-package models
+// Package confine keeps file writes inside one folder: no path that climbs out of it, and no link
+// (junction, symlink, mount point) planted inside it that leads elsewhere.
+package confine
 
 import (
 	"errors"
@@ -11,12 +13,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// noReparse refuses a path whose existing components, from root down, include a reparse point
-// (junction, symlink, mount point): a planted link must never carry a download outside the model folder.
-func noReparse(root, path string) error {
+// NoReparse refuses a path whose existing components, from root down, include a reparse point
+// (junction, symlink, mount point): a planted link must never carry a write outside the folder.
+func NoReparse(root, path string) error {
 	rel, err := filepath.Rel(root, path)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return errors.New("path leaves the model folder")
+		return errors.New("path leaves the folder")
 	}
 	cur := root
 	parts := []string{""}
@@ -37,7 +39,7 @@ func noReparse(root, path string) error {
 			return err
 		}
 		if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-			return errors.New("the model folder contains a link (reparse point); refusing to write through it")
+			return errors.New("the folder contains a link (reparse point); refusing to write through it")
 		}
 	}
 	return nil
@@ -57,8 +59,8 @@ func finalPathOfHandle(h windows.Handle) (string, error) {
 	}
 }
 
-// underRoot re-checks an open file: the path Windows finally resolved must lie under the resolved root.
-func underRoot(f *os.File, root string) error {
+// UnderRoot re-checks an open file: the path Windows finally resolved must lie under the resolved root.
+func UnderRoot(f *os.File, root string) error {
 	got, err := finalPathOfHandle(windows.Handle(f.Fd()))
 	if err != nil {
 		return err
@@ -79,7 +81,7 @@ func underRoot(f *os.File, root string) error {
 	}
 	want = strings.TrimRight(want, `\`) + `\`
 	if len(got) <= len(want) || !strings.EqualFold(got[:len(want)], want) {
-		return errors.New("the file resolved outside the model folder")
+		return errors.New("the file resolved outside the folder")
 	}
 	return nil
 }

@@ -3,6 +3,7 @@
 package hw
 
 import (
+	"context"
 	"errors"
 	"os/exec"
 )
@@ -16,4 +17,9 @@ func querySystem(string) (System, error) { return System{}, errors.New("hardware
 // DiskSpace is Windows only in this build.
 func DiskSpace(string) (free, total uint64, err error) {
 	return 0, 0, errors.New("disk probe: Windows only")
+}
+
+// GPUFree is Windows only in this build.
+func GPUFree(context.Context, int) (int64, error) {
+	return 0, errors.New("gpu probe: Windows only")
 }

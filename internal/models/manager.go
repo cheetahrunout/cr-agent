@@ -506,6 +506,7 @@ func (m *Manager) Delete(modelID string, loaded bool) *Error {
 // Loadable is a model ready for llama-server.
 type Loadable struct {
 	Path   string
+	Size   int64
 	Header *gguf.Header
 }
 
@@ -535,7 +536,11 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 		m.log.Warn("pre-load check failed", "model_id", modelID, "err", err.Error())
 		return nil, errf(protocol.ErrEngineFailed, "the model file failed the GGUF check")
 	}
-	return &Loadable{Path: path, Header: h}, nil
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, errf(protocol.ErrEngineFailed, "the model file cannot be read")
+	}
+	return &Loadable{Path: path, Size: st.Size(), Header: h}, nil
 }
 
 // checkFile is the GGUF pre-check: magic, version, caps, and every tensor inside the file.

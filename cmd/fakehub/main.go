@@ -30,6 +30,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/cheetahrunout/cr-agent/internal/hf/hftest"
+	"github.com/cheetahrunout/cr-agent/internal/updater/relsrv"
 )
 
 const (
@@ -54,7 +55,9 @@ func main() {
 	modelID := flag.String("model-id", "smollm2-360m-q8_0", "model id the hub uses")
 	cancelAfter := flag.Duration("cancel-after", time.Second, "cancel the stream this long after the first token")
 	slow := flag.Duration("chunk-delay", 0, "delay per 64 KiB chunk of the download (to watch progress)")
-	scenario := flag.String("scenario", "full", "full: the whole path with a download; load: only load the agent's local --model with the settings below")
+	scenario := flag.String("scenario", "full", "full: the whole path with a download; load: only load the agent's local --model with the settings below; update: the release dry run")
+	releases := flag.String("releases", "", "scenario update: the folder with v<version>/ release folders")
+	releaseAddr := flag.String("release-addr", "127.0.0.1:9002", "scenario update: listen address of the stand-in for the GitHub release downloads")
 	gpuLayers := flag.Int("gpu-layers", -1, "scenario load: layers on the GPU (-1 = all)")
 	ctxSize := flag.Int("ctx", 8192, "scenario load: context size")
 	threads := flag.Int("threads", 8, "scenario load: threads")
@@ -81,6 +84,18 @@ func main() {
 		log.Printf("stand-in for huggingface.co on %s: %s at %s, %s (%d MB)", hfs.URL, *repo, commit[:12], file, len(data)>>20)
 	}
 
+	var upd *updateRun
+	if *scenario == "update" {
+		if *releases == "" {
+			log.Fatal("-releases is required for the update scenario")
+		}
+		rel, err := relsrv.NewOn(*releaseAddr, *releases)
+		if err != nil {
+			log.Fatal(err)
+		}
+		upd = &updateRun{rel: rel}
+		log.Printf("stand-in for the GitHub release downloads on %s/ serving %s", rel.URL, *releases)
+	}
 	st := &hubState{}
 	done := make(chan int, 1)
 	mux := http.NewServeMux()
@@ -99,6 +114,12 @@ func main() {
 			return
 		}
 		c.SetReadLimit(1 << 20)
+		if upd != nil {
+			if finished, code := upd.session(r.Context(), c); finished {
+				done <- code
+			}
+			return
+		}
 		a := scriptArgs{repo: *repo, file: file, modelID: *modelID, size: int64(len(data)), cancelAfter: *cancelAfter, hf: hfs,
 			gpuLayers: *gpuLayers, ctx: *ctxSize, threads: *threads}
 		if *scenario == "load" {

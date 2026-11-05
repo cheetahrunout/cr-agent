@@ -206,8 +206,8 @@ The `signing` folder holds nothing secret, and you can delete it once the lead h
 
 Not the owner's job. Listed so that nothing falls between two chairs.
 
-1. Paste the signed manifests of 0.1.0 and 0.1.1 into the hub's admin page. **Paste 0.1.2 only for the rollback test, and only while
-   no friend's machine would be offered it:** the hub offers an update to every machine on an older version.
+1. Paste the signed manifests of 0.1.0 and 0.1.1 into the hub's admin page. Paste 0.1.2 only for the rollback test, and press
+   *Withdraw* on it straight after: until then the hub offers it to every machine on an older version and shows it on the download page.
 2. Run the B27 test on one PC: install 0.1.0, press *Update* to 0.1.1, then to 0.1.2. Within 2 minutes the launcher should bring 0.1.1
    back, and the hub should show the update as failed. Then ask for `update{0.1.0}`: it must be refused with "release_seq 1 is older
    than the installed 2". This needs no new signature, because the signed 0.1.0 is already an old, valid release.

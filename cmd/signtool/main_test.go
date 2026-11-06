@@ -194,3 +194,10 @@ func TestPassphraseLength(t *testing.T) {
 		}
 	}
 }
+
+func TestSelfSHA(t *testing.T) {
+	sum, err := selfSHA()
+	if err != nil || len(sum) != 64 {
+		t.Fatalf("%q %v", sum, err)
+	}
+}

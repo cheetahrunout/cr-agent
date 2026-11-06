@@ -29,11 +29,11 @@ func TestMenu(t *testing.T) {
 	if unpaired != want {
 		t.Fatalf("unpaired menu:\n%s\nwant:\n%s", unpaired, want)
 	}
-	s := State{Slug: "anna-tower", Status: "Connected · sharing · in use", Paired: true, ModelsDir: `D:\Models`, Version: "0.1.0", HFToken: "present",
+	s := State{UpdateAvailable: "0.2.1", SandboxBlocked: true, Status: "Connected · sharing · in use", Paired: true, ModelsDir: `D:\Models`, Version: "0.1.0", HFToken: "present",
 		Pending: []Pending{{ID: "wizard-x", Label: "wizard-org/Wizard-X-GGUF (8.0 GB)"}}}
 	items := Menu(s)
 	got := labels(items)
-	for _, part := range []string{"(CR Agent · anna-tower)", "(Connected · sharing · in use)", "\nPause hosting (frees your GPU)\n",
+	for _, part := range []string{"(CR Agent)", "(Connected · sharing · in use)", "Install update 0.2.1…", "run it without…", "\nPause hosting (frees your GPU)\n",
 		"Waiting for you: wizard-org/Wizard-X-GGUF (8.0 GB)…", "Pair again…", "Hugging Face token…   set"} {
 		if !strings.Contains(got, part) {
 			t.Errorf("missing %q in\n%s", part, got)
@@ -55,12 +55,32 @@ func TestMenu(t *testing.T) {
 	}
 }
 
+func TestUpdateAndSandboxItems(t *testing.T) {
+	find := func(s State, a Action) *Item {
+		for _, it := range Menu(s) {
+			if it.Action == a {
+				return &it
+			}
+		}
+		return nil
+	}
+	if find(State{}, ActInstallUpdate) != nil || find(State{}, ActSandbox) != nil {
+		t.Fatal("offered with nothing to offer")
+	}
+	if it := find(State{UpdateAvailable: "0.2.1"}, ActInstallUpdate); it == nil || it.Arg != "0.2.1" || it.Disabled {
+		t.Fatalf("update item %+v", it)
+	}
+	if it := find(State{SandboxOff: true}, ActSandbox); it == nil || !strings.Contains(it.Label, "again") {
+		t.Fatalf("sandbox item %+v", it)
+	}
+}
+
 func TestTooltipFits(t *testing.T) {
-	tip := Tooltip(State{Slug: "anna-tower", Status: strings.Repeat("long status ", 20)})
+	tip := Tooltip(State{Status: strings.Repeat("long status ", 20)})
 	if n := len([]rune(tip)); n > 127 {
 		t.Fatalf("tooltip of %d characters", n)
 	}
-	if !strings.HasPrefix(tip, "CR Agent · anna-tower\n") {
+	if !strings.HasPrefix(tip, "CR Agent\n") {
 		t.Fatalf("tooltip %q", tip)
 	}
 }

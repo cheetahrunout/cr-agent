@@ -1,8 +1,8 @@
 // Command signtool is the offline release signing tool of the CR agent (PLAN §13.1, rulings B18–B21).
 //
 //	signtool pubkey                       derive the key from the passphrase and print its public half
-//	signtool pack -out <zip> -prefix versions/X -dir <dir> [files]   build a release zip (CI runs this)
-//	signtool manifest -dist <dir> -version X   hash a release folder into an unsigned manifest.json (CI runs this)
+//	signtool pack -out <zip> -prefix versions/X -dir <dir> [files]   build a release zip (scripts/build-installer.ps1 runs this)
+//	signtool manifest -dist <dir> -version X   hash a release folder into an unsigned manifest.json (scripts/build-installer.ps1 runs this)
 //	signtool sign -dist <dir> -prev <manifest.json> | -first   re-hash, set release_seq, sign
 //	signtool verify -dist <dir>           check a signed release folder the way an agent would
 //	signtool trust-check                  fail unless the compiled-in key list can ship
@@ -270,6 +270,7 @@ func cmdSign(args []string) error {
 		return errors.New("sign needs -dist")
 	}
 	o.Now = time.Now()
+	printSelf()
 	key, err := src()(false)
 	if err != nil {
 		return err
@@ -283,8 +284,28 @@ func cmdSign(args []string) error {
 	if m.Notes != "" {
 		fmt.Printf("notes:  %s\n", m.Notes)
 	}
-	fmt.Println("Upload manifest.json and manifest.json.minisig, then publish the release.")
+	fmt.Println("Done. The lead publishes it with scripts/publish-release.ps1.")
 	return nil
+}
+
+// printSelf shows this program's own SHA-256 before anything is typed into it, to compare with the
+// value written beside it when it was built (ruling B62).
+func printSelf() {
+	sum, err := selfSHA()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: this tool could not hash itself:", err)
+		return
+	}
+	fmt.Printf("this tool: sha256 %s\n", sum)
+}
+
+func selfSHA() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	sum, _, err := release.HashFile(exe)
+	return sum, err
 }
 
 func cmdVerify(args []string) error {

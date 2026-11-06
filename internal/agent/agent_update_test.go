@@ -196,3 +196,40 @@ func TestEngineCheckBlocksLoad(t *testing.T) {
 		t.Fatal("the engine was started although its files failed the check")
 	}
 }
+
+// Finding M1: the tray starts the update locally, and hello carries what the daily check verified.
+func TestInstallUpdateFromTheTray(t *testing.T) {
+	fu := &fakeUpdater{}
+	restarts := make(chan struct{}, 2)
+	w := newWorldWith(t, func(c *Config) {
+		c.Updater = fu
+		c.Restart = func() { restarts <- struct{}{} }
+		c.LatestVerified = func() string { return "0.1.1" }
+	})
+	h, hello := w.connect()
+	if hello["latest_verified_release"] != "0.1.1" {
+		t.Fatalf("hello %v", hello["latest_verified_release"])
+	}
+	h.send(`{"v":1,"t":"ping","ts":1}`) // the pong means the welcome before it was handled
+	h.next("pong", 2*time.Second)
+	if err := w.a.InstallUpdate("0.1.1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-restarts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no restart")
+	}
+	h.until("progress to the hub", 2*time.Second, func(m map[string]any) bool { return m["t"] == "status" && m["update"] != nil })
+	fu.mu.Lock()
+	fu.err = &updater.Error{Code: "update_failed", Msg: "refused"}
+	fu.mu.Unlock()
+	if err := w.a.InstallUpdate("0.1.2"); err == nil {
+		t.Fatal("a refused update reported success")
+	}
+	select {
+	case <-restarts:
+		t.Fatal("restarted after a refusal")
+	case <-time.After(50 * time.Millisecond):
+	}
+}

@@ -88,6 +88,8 @@ func BuildArgs(l Launch) []string {
 		"--jinja",
 		"--no-webui",
 		"--no-slots",
+		"--cors-origins", "http://127.0.0.1:" + strconv.Itoa(l.Port), // only the engine's own origin: no web page may call it
+		"--no-cors-credentials",
 		"--reasoning-format", "deepseek",
 		"--fit", "off",
 		"-c", strconv.Itoa(s.Ctx),

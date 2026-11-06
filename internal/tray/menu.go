@@ -25,8 +25,10 @@ const (
 	ActOpenLog
 	ActAbout
 	ActQuit
-	ActPending      // a pending approval was chosen from the menu; arg is its id
-	ActNotification // the notification was clicked
+	ActInstallUpdate // the verified latest version; arg is the version
+	ActSandbox       // the host's choice about the engine's low-integrity sandbox
+	ActPending       // a pending approval was chosen from the menu; arg is its id
+	ActNotification  // the notification was clicked
 )
 
 // Pending is a download waiting for the host's Allow or Deny.
@@ -37,7 +39,6 @@ type Pending struct {
 
 // State is everything the tray shows.
 type State struct {
-	Slug      string // empty when not paired
 	Status    string
 	Icon      status.Icon
 	Paired    bool
@@ -46,6 +47,10 @@ type State struct {
 	ModelsDir string
 	HFToken   string // absent | present | invalid
 	Version   string
+	// UpdateAvailable is the version the agent's own daily check verified, never one the hub named.
+	UpdateAvailable string
+	SandboxBlocked  bool // CUDA does not work under low integrity here: offer the opt-in
+	SandboxOff      bool // the host chose to run the engine outside the sandbox
 }
 
 // Item is one menu row.
@@ -59,12 +64,8 @@ type Item struct {
 
 // Menu builds the menu for a state. The wording follows the mockup in §3.5.6.
 func Menu(s State) []Item {
-	title := "CR Agent"
-	if s.Slug != "" {
-		title += " · " + s.Slug
-	}
 	items := []Item{
-		{Label: title, Disabled: true},
+		{Label: "CR Agent", Disabled: true},
 		{Label: s.Status, Disabled: true},
 		{Separator: true},
 	}
@@ -75,6 +76,15 @@ func Menu(s State) []Item {
 	}
 	for _, p := range s.Pending {
 		items = append(items, Item{Label: "Waiting for you: " + p.Label + "…", Action: ActPending, Arg: p.ID})
+	}
+	if s.UpdateAvailable != "" {
+		items = append(items, Item{Label: "Install update " + s.UpdateAvailable + "…", Action: ActInstallUpdate, Arg: s.UpdateAvailable})
+	}
+	switch {
+	case s.SandboxOff:
+		items = append(items, Item{Label: "Run the engine in its sandbox again…", Action: ActSandbox})
+	case s.SandboxBlocked:
+		items = append(items, Item{Label: "The engine cannot use the GPU in its sandbox: run it without…", Action: ActSandbox})
 	}
 	items = append(items, Item{Separator: true})
 	if s.Paired {
@@ -103,11 +113,7 @@ func Menu(s State) []Item {
 
 // Tooltip is the icon's hover text, within Windows' 127 characters.
 func Tooltip(s State) string {
-	t := "CR Agent"
-	if s.Slug != "" {
-		t += " · " + s.Slug
-	}
-	t += "\n" + s.Status
+	t := "CR Agent\n" + s.Status
 	if r := []rune(t); len(r) > 127 {
 		t = string(r[:126]) + "…"
 	}

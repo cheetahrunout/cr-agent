@@ -20,7 +20,10 @@ import (
 	"time"
 )
 
-const githubPrefix = "/cheetahrunout/cr-agent/releases/download"
+const (
+	githubPrefix = "/cheetahrunout/cr-agent/releases/download"
+	githubLatest = "/cheetahrunout/cr-agent/releases/latest/download"
+)
 
 // Server is the fake.
 type Server struct {
@@ -31,11 +34,13 @@ type Server struct {
 	requests []string
 
 	// Knobs.
-	Direct     bool   // serve archives without a redirect (stand-in mode)
-	RedirectTo string // redirect archives here instead (a host that is not allowed)
-	CutAfter   int64  // cut the first CutTimes archive responses after this many bytes
-	CutTimes   int32
-	cut        atomic.Int32
+	Direct           bool   // serve archives without a redirect (stand-in mode)
+	RedirectTo       string // redirect archives here instead (a host that is not allowed)
+	Latest           string // the version GitHub calls latest; "" answers 404, as before a first release
+	RedirectLatestTo string // redirect the latest path here instead (a host that is not allowed)
+	CutAfter         int64  // cut the first CutTimes archive responses after this many bytes
+	CutTimes         int32
+	cut              atomic.Int32
 }
 
 // New serves dir on a free local port, for use through Transport().
@@ -96,6 +101,8 @@ func (s *Server) Transport() http.RoundTripper {
 		switch {
 		case r.URL.Scheme == "https" && h == "github.com" && strings.HasPrefix(r.URL.Path, githubPrefix+"/"):
 			out.URL.Path = strings.TrimPrefix(r.URL.Path, githubPrefix)
+		case r.URL.Scheme == "https" && h == "github.com" && strings.HasPrefix(r.URL.Path, githubLatest+"/"):
+			out.URL.Path = "/latest/download" + strings.TrimPrefix(r.URL.Path, githubLatest)
 		case r.URL.Scheme == "https" && (h == "objects.githubusercontent.com" || h == "release-assets.githubusercontent.com"):
 		default:
 			return nil, fmt.Errorf("relsrv: request to %s://%s%s left the allowed hosts", r.URL.Scheme, r.URL.Host, r.URL.Path)
@@ -115,6 +122,25 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	direct, to := s.Direct, s.RedirectTo
 	s.mu.Unlock()
 	path := r.URL.Path
+	if name, ok := strings.CutPrefix(path, "/latest/download/"); ok {
+		s.mu.Lock()
+		latest, away := s.Latest, s.RedirectLatestTo
+		s.mu.Unlock()
+		if away != "" {
+			http.Redirect(w, r, away, http.StatusFound)
+			return
+		}
+		if latest == "" {
+			http.NotFound(w, r)
+			return
+		}
+		target := "/v" + latest + "/" + name
+		if !direct && r.Host == "github.com" {
+			target = githubPrefix + target
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+		return
+	}
 	cdn := strings.HasPrefix(path, "/cdn/")
 	if cdn {
 		path = strings.TrimPrefix(path, "/cdn")

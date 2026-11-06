@@ -734,3 +734,107 @@ func TestInspectLargeHeader(t *testing.T) {
 		t.Fatalf("vocab %d, read %d bytes in %d requests", facts.Header.NVocab, facts.ReadBytes, e.srv.BlobRequests.Load())
 	}
 }
+
+// Finding M2: allowing one file of a commit does not allow another file of that commit.
+func TestApprovalIsPerFile(t *testing.T) {
+	e := newEnv(t)
+	e.srv.AddRepo("wizard-org/Two-GGUF", commitA, false, map[string][]byte{"benign.gguf": e.model, "evil.gguf": e.model[:len(e.model)-64]})
+	e.ap.answer = true
+	if o := e.download(args("benign", "wizard-org/Two-GGUF", commitA, "benign.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	asked := e.ap.asked()
+	if len(asked) != 1 || len(asked[0].Files) != 1 || asked[0].Files[0] != "benign.gguf" {
+		t.Fatalf("the host was shown %+v", asked)
+	}
+	e.ap.answer = false
+	o := e.download(args("evil", "wizard-org/Two-GGUF", commitA, "evil.gguf"))
+	if o.Err == nil || o.Err.Code != protocol.ErrDenied || len(e.ap.asked()) != 2 || e.ap.asked()[1].Files[0] != "evil.gguf" {
+		t.Fatalf("another file of an allowed commit: %v, %d prompts", o.Err, len(e.ap.asked()))
+	}
+	if _, lerr := e.m.Resolve("evil"); lerr == nil {
+		t.Fatal("a file the host never allowed can be loaded")
+	}
+	// Both files in one request, one of them allowed before: it asks.
+	if o := e.download(args("both", "wizard-org/Two-GGUF", commitA, "benign.gguf", "evil.gguf")); o.Err == nil || len(e.ap.asked()) != 3 {
+		t.Fatalf("a request with one unapproved file: %v, %d prompts", o.Err, len(e.ap.asked()))
+	}
+	// The file the host did allow is remembered.
+	if err := e.m.Delete("benign", false); err != nil {
+		t.Fatal(err)
+	}
+	if o := e.download(args("benign", "wizard-org/Two-GGUF", commitA, "benign.gguf")); o.Err != nil || len(e.ap.asked()) != 3 {
+		t.Fatalf("the allowed file asked again: %v, %d prompts", o.Err, len(e.ap.asked()))
+	}
+}
+
+// Finding M3: a file that changed on disk is refused at its first load in this process.
+func TestLoadHashesTheFile(t *testing.T) {
+	e := newEnv(t)
+	if o := e.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	p := tinyPath(e.root)
+	b, _ := os.ReadFile(p)
+	flipped := append([]byte(nil), b...)
+	flipped[len(flipped)-1] ^= 0xff
+	os.WriteFile(p, flipped, 0o644)
+	_, lerr := e.m.Resolve("tiny")
+	if lerr == nil || lerr.Code != protocol.ErrHashMismatch || e.state("tiny") != StateError {
+		t.Fatalf("a changed file of the same size: %v, state %q", lerr, e.state("tiny"))
+	}
+	// A clean copy is hashed once, and a repeat of the same load in this process does not hash again.
+	e2 := newEnv(t)
+	if o := e2.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	if _, lerr := e2.m.Resolve("tiny"); lerr != nil {
+		t.Fatal(lerr)
+	}
+	if len(e2.m.hashed) != 1 {
+		t.Fatalf("%d files hashed", len(e2.m.hashed))
+	}
+	e2.m.Close()
+	e2.open() // a new process hashes again
+	if len(e2.m.hashed) != 0 {
+		t.Fatal("a new manager starts with hashes")
+	}
+	q := tinyPath(e2.root)
+	c, _ := os.ReadFile(q)
+	c[len(c)-1] ^= 0xff
+	os.WriteFile(q, c, 0o644)
+	if _, lerr := e2.m.Resolve("tiny"); lerr == nil || lerr.Code != protocol.ErrHashMismatch {
+		t.Fatalf("after a restart: %v", lerr)
+	}
+}
+
+// Finding M3: an entry only the index names is not loadable, and downloading it asks the host.
+func TestIndexAloneGrantsNothing(t *testing.T) {
+	e := newEnv(t)
+	other := filepath.Join(t.TempDir(), "folder")
+	file := filepath.Join(other, "wizard-org", "Wizard-GGUF", commitA[:12], "W-Q4_K_M.gguf")
+	os.MkdirAll(filepath.Dir(file), 0o755)
+	os.WriteFile(file, e.model, 0o644)
+	idx := indexFile{Version: 1, Models: []*Entry{{ModelID: "wiz", Repo: "wizard-org/Wizard-GGUF", Commit: commitA, Kind: "gguf", Names: []string{"W-Q4_K_M.gguf"},
+		Files: []protocol.LocalFile{{Path: "W-Q4_K_M.gguf", Size: int64(len(e.model)), SHA256: hftest.SHA256(e.model)}}, State: StateReady}}}
+	j, _ := json.Marshal(idx)
+	os.WriteFile(filepath.Join(other, indexName), j, 0o644)
+	if err := e.m.SetDir(other); err != nil {
+		t.Fatal(err)
+	}
+	if _, lerr := e.m.Resolve("wiz"); lerr == nil || lerr.Code != protocol.ErrDenied {
+		t.Fatalf("an entry only the index names: %v", lerr)
+	}
+	// The way out is the ordinary one: the host is asked, and on Allow the file on disk is used by its hash.
+	e.ap.answer = true
+	before := e.srv.BlobRequests.Load()
+	if o := e.download(args("wiz", "wizard-org/Wizard-GGUF", commitA, "W-Q4_K_M.gguf")); o.Err != nil || len(e.ap.asked()) != 1 {
+		t.Fatalf("download: %v, %d prompts", o.Err, len(e.ap.asked()))
+	}
+	if e.srv.BlobRequests.Load() != before {
+		t.Fatal("the file was fetched again although it is on disk with the right hash")
+	}
+	if _, lerr := e.m.Resolve("wiz"); lerr != nil {
+		t.Fatal(lerr)
+	}
+}

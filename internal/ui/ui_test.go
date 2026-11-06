@@ -19,9 +19,9 @@ func TestHumanSize(t *testing.T) {
 }
 
 func TestApprovalText(t *testing.T) {
-	p := models.Prompt{Repo: "wizard-org/Wizard-X-GGUF", Files: []string{"Wizard-X-Q4_K_M.gguf"}, SizeBytes: 8 << 30}
+	p := models.Prompt{Repo: "wizard-org/Wizard-X-GGUF", Commit: "7c1e2a9d40b3f1e8a9c0d2b4e6f8a1c3e5d7f9b2", Files: []string{"Wizard-X-Q4_K_M.gguf"}, SizeBytes: 8 << 30}
 	text := ApprovalText(p)
-	for _, part := range []string{"not on the built-in list", "wizard-org/Wizard-X-GGUF", "Wizard-X-Q4_K_M.gguf · 8.0 GB", "only if you asked for this in the hub"} {
+	for _, part := range []string{"not on the built-in list", "wizard-org/Wizard-X-GGUF", "Wizard-X-Q4_K_M.gguf\n8.0 GB · commit 7c1e2a9d40b3", "only if you asked for this in the hub"} {
 		if !strings.Contains(text, part) {
 			t.Errorf("missing %q in %q", part, text)
 		}
@@ -29,7 +29,7 @@ func TestApprovalText(t *testing.T) {
 	p.AllowedBefore = true
 	p.Files = []string{"a.gguf", "b.gguf", "c.gguf", "d.gguf", "e.gguf"}
 	text = ApprovalText(p)
-	if !strings.Contains(text, "new version of a repo you allowed before") || !strings.Contains(text, "and 2 more files") || strings.Contains(text, "d.gguf") {
+	if !strings.Contains(text, "new version of a repo you allowed before") || !strings.Contains(text, "a.gguf\nb.gguf\nc.gguf\nd.gguf\ne.gguf\n") {
 		t.Errorf("repeat prompt: %q", text)
 	}
 	if ApprovalLabel(p) != "wizard-org/Wizard-X-GGUF (8.0 GB)" {

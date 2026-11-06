@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -29,11 +30,12 @@ type proc struct {
 
 // spawnOptions controls how the child is started.
 type spawnOptions struct {
-	Exe      string
-	Args     []string
-	Dir      string
-	LowIL    bool   // start with a low-integrity duplicate of our token
-	MemLimit uint64 // job memory cap in bytes, 0 = none
+	Exe       string
+	Args      []string
+	Dir       string
+	LowIL     bool   // start with a low-integrity duplicate of our token
+	MemLimit  uint64 // job memory cap in bytes, 0 = none
+	GPUSelect string
 }
 
 func spawn(o spawnOptions) (*proc, error) {
@@ -118,7 +120,7 @@ func spawn(o spawnOptions) (*proc, error) {
 	if err != nil {
 		return nil, err
 	}
-	env := envBlock(childEnv())
+	env := envBlock(childEnv(o.GPUSelect))
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT |
 		windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_DEFAULT_ERROR_MODE)
 
@@ -126,11 +128,14 @@ func spawn(o spawnOptions) (*proc, error) {
 	if o.LowIL {
 		tok, err := lowIntegrityToken()
 		if err != nil {
-			return nil, fmt.Errorf("low-integrity token: %w", err)
+			return nil, fmt.Errorf("%w: %v", ErrLowILUnavailable, err)
 		}
 		err = windows.CreateProcessAsUser(tok, exe16, cmd16, nil, nil, true, flags, &env[0], dir16, &si.StartupInfo, &pi)
 		tok.Close()
 		if err != nil {
+			if tokenError(err) {
+				return nil, fmt.Errorf("%w: CreateProcessAsUser: %v", ErrLowILUnavailable, err)
+			}
 			return nil, fmt.Errorf("CreateProcessAsUser: %w", err)
 		}
 	} else {
@@ -207,6 +212,22 @@ func (p *proc) PeakMemory() uint64 {
 	return p.jobPeak()
 }
 
+// tokenError tells a failure of the token from any other: the process was not created because of what
+// the token is or may do, not because of the file, its arguments or the model.
+func tokenError(err error) bool {
+	for _, code := range []windows.Errno{
+		windows.ERROR_PRIVILEGE_NOT_HELD, windows.ERROR_NO_TOKEN, windows.ERROR_BAD_TOKEN_TYPE,
+		windows.ERROR_TOKEN_ALREADY_IN_USE, windows.ERROR_BAD_IMPERSONATION_LEVEL, windows.ERROR_INVALID_OWNER,
+		windows.Errno(1367), // ERROR_NO_SUCH_LOGON_SESSION
+		windows.Errno(1385), // ERROR_LOGON_TYPE_NOT_GRANTED
+	} {
+		if errors.Is(err, code) {
+			return true
+		}
+	}
+	return false
+}
+
 // lowIntegrityToken duplicates our primary token and lowers it to the low mandatory level (S-1-16-4096).
 func lowIntegrityToken() (windows.Token, error) {
 	var cur windows.Token
@@ -232,15 +253,37 @@ func lowIntegrityToken() (windows.Token, error) {
 	return dup, nil
 }
 
-// childEnv is our environment minus every LLAMA_* variable: llama-server reads LLAMA_ARG_* as flags,
-// and the agent alone decides the flags.
-func childEnv() []string {
+// engineEnvAllow is everything the engine's environment may hold, by name, upper case. It is a list
+// of what Windows and the CUDA runtime need, so nothing else on the PC reaches the engine: not a token
+// (HF_TOKEN), not llama-server's own LLAMA_ARG_* flags, not GGML_BACKEND_PATH or CUDA_INJECTION64_PATH,
+// which load a DLL of someone's choosing.
+var engineEnvAllow = map[string]bool{
+	"SYSTEMROOT": true, "SYSTEMDRIVE": true, "WINDIR": true, "OS": true, "COMSPEC": true,
+	"TEMP": true, "TMP": true, "USERPROFILE": true, "USERNAME": true, "HOMEDRIVE": true, "HOMEPATH": true,
+	"LOCALAPPDATA": true, "APPDATA": true, "PROGRAMDATA": true, "ALLUSERSPROFILE": true, "PUBLIC": true,
+	"PROGRAMFILES": true, "PROGRAMFILES(X86)": true, "PROGRAMW6432": true,
+	"COMMONPROGRAMFILES": true, "COMMONPROGRAMFILES(X86)": true, "COMMONPROGRAMW6432": true,
+	"NUMBER_OF_PROCESSORS": true, "PROCESSOR_ARCHITECTURE": true, "PROCESSOR_IDENTIFIER": true,
+	"PROCESSOR_LEVEL": true, "PROCESSOR_REVISION": true, "COMPUTERNAME": true,
+	"CUDA_DEVICE_ORDER": true, "CUDA_CACHE_PATH": true, "CUDA_CACHE_MAXSIZE": true, "CUDA_CACHE_DISABLE": true,
+}
+
+// childEnv builds the engine's environment from the allowlist. PATH is fixed to the system folders:
+// the engine's own DLLs are found beside it, and the CUDA driver is in System32. gpuSelect "0".."7"
+// limits the engine to that GPU, whatever the variable said before.
+func childEnv(gpuSelect string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(strings.ToUpper(kv), "LLAMA_") {
-			continue
+		name, _, ok := strings.Cut(kv, "=")
+		if ok && engineEnvAllow[strings.ToUpper(name)] {
+			env = append(env, kv)
 		}
-		env = append(env, kv)
+	}
+	if sys, err := windows.GetSystemDirectory(); err == nil {
+		env = append(env, "PATH="+sys+";"+filepath.Dir(sys))
+	}
+	if len(gpuSelect) == 1 && gpuSelect[0] >= '0' && gpuSelect[0] <= '7' {
+		env = append(env, "CUDA_VISIBLE_DEVICES="+gpuSelect)
 	}
 	sort.Slice(env, func(i, j int) bool { return strings.ToUpper(env[i]) < strings.ToUpper(env[j]) })
 	return env

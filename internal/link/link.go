@@ -116,9 +116,13 @@ func New(cfg Config) *Client {
 	if cfg.OnPhase == nil {
 		cfg.OnPhase = func(Phase) {}
 	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+	// The upgrade carries the machine key and goes to the validated host: a redirect is never followed.
+	hc := http.Client{}
+	if cfg.HTTPClient != nil {
+		hc = *cfg.HTTPClient
 	}
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	cfg.HTTPClient = &hc
 	log := cfg.Log
 	if log == nil {
 		log = slog.Default()
@@ -291,7 +295,7 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, s *Session)
 			_ = s.Send(&protocol.Pong{TS: f.TS})
 		case *protocol.Welcome:
 			clampWelcome(f)
-			c.log.Info("welcome", "proto", f.Proto, "mode", f.Mode, "ping_interval_s", f.PingIntervalS)
+			c.log.Info("welcome", "proto", Clip(f.Proto), "mode", f.Mode, "ping_interval_s", f.PingIntervalS)
 			c.cfg.Handler.OnWelcome(s, f)
 			c.cfg.OnPhase(PhaseConnected)
 		case *protocol.Reject:
@@ -310,21 +314,34 @@ func (c *Client) decodeError(s *Session, err error) {
 	var re *protocol.ReqError
 	switch {
 	case errors.As(err, &ut):
-		c.log.Info("unknown frame type dropped", "t", ut.T)
+		c.log.Info("unknown frame type dropped", "t", Clip(ut.T))
 	case errors.As(err, &ce):
-		c.log.Warn("command refused", "id", ce.ID, "op", ce.Op, "code", ce.Code, "field", ce.Field)
+		c.log.Warn("command refused", "id", ce.ID, "op", Clip(ce.Op), "code", ce.Code, "field", Clip(ce.Field))
 		if ce.ID != "" {
 			_ = s.Send(&protocol.CmdErr{ID: ce.ID, Code: ce.Code, Field: ce.Field, Message: ce.Msg})
 		}
 	case errors.As(err, &re):
-		c.log.Warn("request refused", "id", re.ID, "why", re.Msg)
+		c.log.Warn("request refused", "id", re.ID, "why", Clip(re.Msg))
 		if re.ID != "" {
 			_ = s.Send(&protocol.ResHead{ID: re.ID, Status: http.StatusBadRequest, CType: "application/json"})
 			_ = s.Send(&protocol.ResEnd{ID: re.ID, Reason: protocol.ReasonError, Error: "invalid_request"})
 		}
 	default:
-		c.log.Warn("malformed frame dropped", "err", err.Error())
+		c.log.Warn("malformed frame dropped", "err", Clip(err.Error()))
 	}
+}
+
+// Clip shortens a string that came from the hub before it goes to the log (finding L4).
+func Clip(s string) string {
+	const max = 120
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && s[cut]&0xC0 == 0x80 { // not in the middle of a UTF-8 character
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // clampWelcome keeps hub values inside agent-side bounds (ruling B14).

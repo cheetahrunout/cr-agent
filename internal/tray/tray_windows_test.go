@@ -30,7 +30,7 @@ func TestTrayLifecycle(t *testing.T) {
 		t.Fatal("tray did not start")
 	}
 	for _, icon := range []status.Icon{status.IconRing, status.IconGreen, status.IconAmber, status.IconGrey, status.IconGreyBang} {
-		tr.Update(State{Slug: "test-pc", Status: "Connected · sharing · no model loaded", Icon: icon, Paired: true, Version: "test"})
+		tr.Update(State{Status: "Connected · sharing · no model loaded", Icon: icon, Paired: true, Version: "test"})
 		deadline := time.Now().Add(2 * time.Second) // updates coalesce, so wait for each to be drawn
 		for {
 			tr.mu.Lock()

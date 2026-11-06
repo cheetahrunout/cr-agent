@@ -29,6 +29,9 @@ type Config struct {
 	KeepAwake     bool   `json:"keep_awake,omitempty"`
 	IdleUnloadMin int    `json:"idle_unload_min,omitempty"`
 	GPUSelect     string `json:"gpu_select,omitempty"`
+	// EngineNormalIntegrity is the host's own click in the tray: CUDA does not work under low integrity
+	// on this PC, and the host chose to run the engine outside that sandbox. The hub cannot set it.
+	EngineNormalIntegrity bool `json:"engine_normal_integrity,omitempty"`
 }
 
 // Names of the secrets and state files.

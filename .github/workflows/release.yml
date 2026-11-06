@@ -1,95 +1,34 @@
-name: release
+name: release cross-check
 
-# Builds a release and publishes it as a DRAFT with an UNSIGNED manifest.json. Two ways in:
-#
-#   a tag v<x.y.z>     every normal release.
-#   Run workflow       (workflow_dispatch) only for the rollback test of PLAN ruling B27: the version
-#                      and the box "rollback_test" are typed by hand, the agent of that one release is
-#                      linked with -X main.sabotage=unhealthy-<version> and never passes the health
-#                      gate, and the source on main does not change. No tag is pushed for it: the tag
-#                      appears when the draft is published.
-#
-# There is no signing key and no secret here, and there never will be (PLAN §13): the manifest is
-# signed afterwards, offline, by a person typing the passphrase into signtool, who then uploads
-# manifest.json and manifest.json.minisig and publishes the draft. A draft is invisible to agents:
-# they fetch only from /releases/download/v<version>/ of a published release, and refuse anything
-# without a valid signature.
+# A tag v<x.y.z> builds and tests the release as a cross-check that it compiles here too. It publishes
+# nothing: since ruling B62 release files are built on the owner's PC from the local checkout
+# (scripts/build-release.ps1), signed there, and GitHub is transport only. This workflow has no write
+# permission and no secret, and it must never get one.
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version of the rollback-test release, x.y.z. There must be no tag or release for it yet."
-        required: true
-        type: string
-      rollback_test:
-        description: "Yes: build the agent of this release so that it never becomes healthy. Normal releases come from a tag, not from here."
-        required: true
-        type: boolean
-        default: false
 
 permissions:
-  contents: write # to create the draft release with the workflow's own token; nothing else
+  contents: read
 
 jobs:
-  gate:
+  cross-check:
     runs-on: windows-latest
-    outputs:
-      proceed: ${{ steps.decide.outputs.proceed }}
-      version: ${{ steps.decide.outputs.version }}
-      tag: ${{ steps.decide.outputs.tag }}
-      rollback: ${{ steps.decide.outputs.rollback }}
     steps:
-      - name: what to build
-        id: decide
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_ROLLBACK: ${{ inputs.rollback_test }}
-          REPO: ${{ github.repository }}
-        run: |
-          if ($env:EVENT -eq "workflow_dispatch") {
-            if ($env:INPUT_ROLLBACK -ne "true") { throw "this form is only for the rollback test; a normal release is a tag v<x.y.z>" }
-            if ($env:INPUT_VERSION -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3})$') { throw "version must be x.y.z" }
-            $version = $Matches[1]; $tag = "v$version"; $rollback = "true"
-            git ls-remote --exit-code --tags "https://github.com/$env:REPO" "refs/tags/$tag" *> $null
-            if ($LASTEXITCODE -eq 0) { throw "tag $tag exists already: the rollback test needs a version that was never tagged" }
-          } else {
-            if ($env:REF_NAME -notmatch '^v(\d{1,3}\.\d{1,3}\.\d{1,3})$') { throw "tag $env:REF_NAME is not v<x.y.z>" }
-            $version = $Matches[1]; $tag = $env:REF_NAME; $rollback = "false"
-          }
-          # A release exists for this tag: a tag is released once. On a tag push this is also what happens
-          # when publishing the rollback test's draft creates its tag, so it is a quiet stop there.
-          gh release view $tag --repo $env:REPO *> $null
-          $exists = $LASTEXITCODE -eq 0
-          $global:LASTEXITCODE = 0
-          if ($exists -and $env:EVENT -eq "workflow_dispatch") { throw "a release for $tag exists already" }
-          if ($exists) { "::notice::a release for $tag exists already; nothing to build" }
-          "proceed=$(if ($exists) { 'false' } else { 'true' })" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "rollback=$rollback" >> $env:GITHUB_OUTPUT
-
-  release:
-    needs: gate
-    if: needs.gate.outputs.proceed == 'true'
-    runs-on: windows-latest
-    env:
-      VERSION: ${{ needs.gate.outputs.version }}
-      TAG: ${{ needs.gate.outputs.tag }}
-      ROLLBACK: ${{ needs.gate.outputs.rollback }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
-      # No release without a production key in protocol/release-keys.json, and never with the test key.
+      - name: version from the tag
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:TAG -notmatch '^v(\d{1,3}\.\d{1,3}\.\d{1,3})$') { throw "tag $env:TAG is not v<x.y.z>" }
+          "VERSION=$($Matches[1])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: the key list is fit to ship
         shell: bash
         run: go run ./cmd/signtool trust-check
@@ -107,49 +46,12 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-engine.ps1 -Out "$env:RUNNER_TEMP\engine"
 
-      # CPU only: the pinned build is the one engine.lock names, and it knows every flag the agent emits.
       - name: engine smoke test
         shell: bash
         env:
           CRAGENT_ENGINE_DIR: ${{ runner.temp }}\engine
         run: go test -count=1 -run 'TestPinnedEngine' -v ./internal/supervisor
 
-      - name: Inno Setup
+      - name: build the agent, the launcher, the archives and the manifest (not kept)
         shell: pwsh
-        run: |
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
-
-      - name: build the agent, the launcher, the archives, the installer and the unsigned manifest
-        shell: pwsh
-        run: |
-          $extra = @{}
-          if ($env:ROLLBACK -eq "true") { $extra.RollbackTest = $true }
-          ./scripts/build-installer.ps1 -Version $env:VERSION -EngineDir "$env:RUNNER_TEMP\engine" -Out "$env:RUNNER_TEMP\release" @extra
-
-      - name: SHA-256 of every asset
-        shell: pwsh
-        run: |
-          Set-Location "$env:RUNNER_TEMP\release\dist"
-          # manifest.json is rewritten when it is signed, so it is not listed.
-          Get-ChildItem -File | Where-Object Name -notin "SHA256SUMS.txt", "manifest.json" | ForEach-Object {
-            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
-          } | Set-Content SHA256SUMS.txt -Encoding utf8
-          Get-Content SHA256SUMS.txt
-
-      - name: draft release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-        run: |
-          $dist = "$env:RUNNER_TEMP\release\dist"
-          $title = "cr-agent $env:VERSION"
-          $notes = "Draft of cr-agent $env:VERSION. NOT SIGNED YET. Follow docs/first-release.md: download, check against SHA256SUMS.txt, sign offline, upload manifest.json and manifest.json.minisig, publish."
-          if ($env:ROLLBACK -eq "true") {
-            $title += " ROLLBACK TEST"
-            $notes = "ROLLBACK TEST (PLAN B27): the agent in this release never passes the health gate, so the launcher reverts it. Publish it as a prerelease, never as latest, and never offer it to friends. " + $notes
-          }
-          $files = @(Get-ChildItem $dist -File | ForEach-Object FullName)
-          gh release create $env:TAG --repo $env:REPO --draft --target $env:SHA --title $title --notes $notes @files
-          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+        run: ./scripts/build-installer.ps1 -Version $env:VERSION -EngineDir "$env:RUNNER_TEMP\engine" -Out "$env:RUNNER_TEMP\release" -NoInstaller

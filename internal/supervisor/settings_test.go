@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func TestBuildArgs(t *testing.T) {
 	s.KVType, s.FlashAttn = "q8_0", "auto"
 	args := BuildArgs(Launch{ModelPath: `C:\m\x.gguf`, Alias: "x", Port: 5555, APIKey: "k", Settings: s})
 	line := strings.Join(args, " ")
-	for _, want := range []string{"--alias x", "--host 127.0.0.1", "--port 5555", "--api-key k", "--jinja", "--no-webui", "--no-slots",
+	for _, want := range []string{"--cors-origins http://127.0.0.1:5555", "--no-cors-credentials", "--alias x", "--host 127.0.0.1", "--port 5555", "--api-key k", "--jinja", "--no-webui", "--no-slots",
 		"--fit off", "-c 4096", "-ngl 999", "-t 8", "-ctk q8_0", "-ctv q8_0", "-fa auto", "-np 1", "--reasoning-format deepseek"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q in %s", want, line)
@@ -61,5 +62,12 @@ func TestBuildArgs(t *testing.T) {
 	line = strings.Join(BuildArgs(Launch{ModelPath: "m.gguf", Alias: "x", Port: 1, APIKey: "k", Settings: s}), " ")
 	if !strings.Contains(line, "-ngl 12") || !strings.Contains(line, "--chat-template chatml") {
 		t.Errorf("args %s", line)
+	}
+}
+
+// Finding L7: without an engine folder nothing is looked for in the current directory.
+func TestStartNeedsAnEngineFolder(t *testing.T) {
+	if _, err := Start(context.Background(), Config{}); err == nil || !strings.Contains(err.Error(), "no engine folder") {
+		t.Fatalf("got %v", err)
 	}
 }

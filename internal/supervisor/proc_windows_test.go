@@ -3,12 +3,16 @@
 package supervisor
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 func sys32(t *testing.T, exe string) string {
@@ -64,12 +68,50 @@ func TestLowIntegrityChild(t *testing.T) {
 	}
 }
 
-// LLAMA_* variables never reach the engine (llama-server reads LLAMA_ARG_* as flags).
-func TestChildEnvDropsLlamaVars(t *testing.T) {
-	t.Setenv("LLAMA_ARG_RPC", "10.0.0.1:50052")
+// The engine's environment is an allowlist (finding L3): nothing else on the PC reaches it.
+func TestChildEnvIsAnAllowlist(t *testing.T) {
+	for k, v := range map[string]string{"LLAMA_ARG_RPC": "10.0.0.1:50052", "HF_TOKEN": "hf_secret", "CRAGENT_KEY": "crm_secret",
+		"GGML_BACKEND_PATH": `C:\evil\x.dll`, "CUDA_INJECTION64_PATH": `C:\evil\y.dll`, "SOME_OTHER_APP_TOKEN": "s", "PATH": `C:\evil;C:\other`,
+		"CUDA_CACHE_MAXSIZE": "1000", "CUDA_VISIBLE_DEVICES": "5"} {
+		t.Setenv(k, v)
+	}
 	cmd := sys32(t, "cmd.exe")
 	out, _, _ := runSpawn(t, spawnOptions{Exe: cmd, Args: []string{"/c", "set"}, Dir: os.TempDir()})
-	if strings.Contains(out, "LLAMA_ARG_RPC") || !strings.Contains(strings.ToUpper(out), "SYSTEMROOT") {
-		t.Fatalf("environment wrong: %q", out)
+	up := strings.ToUpper(out)
+	for _, name := range []string{"LLAMA_ARG_RPC", "HF_TOKEN", "CRAGENT_KEY", "GGML_BACKEND_PATH", "CUDA_INJECTION64_PATH", "SOME_OTHER_APP_TOKEN", `C:\EVIL`, "CUDA_VISIBLE_DEVICES"} {
+		if strings.Contains(up, name) {
+			t.Errorf("%s reached the engine:\n%s", name, out)
+		}
+	}
+	for _, name := range []string{"SYSTEMROOT=", "TEMP=", "LOCALAPPDATA=", "CUDA_CACHE_MAXSIZE=1000", "PATH="} {
+		if !strings.Contains(up, name) {
+			t.Errorf("%s is missing:\n%s", name, out)
+		}
+	}
+	// gpu_select limits the engine to one GPU; "all" leaves it alone.
+	out, _, _ = runSpawn(t, spawnOptions{Exe: cmd, Args: []string{"/c", "set"}, Dir: os.TempDir(), GPUSelect: "1"})
+	if !strings.Contains(out, "CUDA_VISIBLE_DEVICES=1") {
+		t.Errorf("gpu_select 1 did not reach the engine:\n%s", out)
+	}
+	out, _, _ = runSpawn(t, spawnOptions{Exe: cmd, Args: []string{"/c", "set"}, Dir: os.TempDir(), GPUSelect: "all"})
+	if strings.Contains(out, "CUDA_VISIBLE_DEVICES") {
+		t.Errorf("gpu_select all set a device:\n%s", out)
+	}
+}
+
+// Only a failure of the token itself may lead to a start at normal integrity.
+func TestTokenErrors(t *testing.T) {
+	if !tokenError(windows.ERROR_PRIVILEGE_NOT_HELD) || !tokenError(fmt.Errorf("x: %w", windows.ERROR_BAD_TOKEN_TYPE)) {
+		t.Error("a token error was not recognised")
+	}
+	for _, err := range []error{windows.ERROR_FILE_NOT_FOUND, windows.ERROR_ACCESS_DENIED, windows.ERROR_BAD_EXE_FORMAT, windows.ERROR_NOT_ENOUGH_MEMORY, errors.New("exited")} {
+		if tokenError(err) {
+			t.Errorf("%v taken for a token error", err)
+		}
+	}
+	// A real start under the low-integrity token that fails for another reason is no token error.
+	_, err := spawn(spawnOptions{Exe: filepath.Join(t.TempDir(), "absent.exe"), Dir: os.TempDir(), LowIL: true})
+	if err == nil || errors.Is(err, ErrLowILUnavailable) {
+		t.Fatalf("a missing file under low integrity: %v", err)
 	}
 }

@@ -83,6 +83,9 @@ type state struct {
 	Manifest         []byte   `json:"manifest,omitempty"`
 	Sig              []byte   `json:"sig,omitempty"`
 	Pending          *pending `json:"pending,omitempty"`
+	// The newest release the daily check verified (§13, ruling B9): the hub has no say in these.
+	LatestVersion string `json:"latest_version,omitempty"`
+	LatestSeq     int64  `json:"latest_seq,omitempty"`
 }
 
 // Updater installs releases and guards the installed one.
@@ -122,19 +125,34 @@ func New(cfg Config) (*Updater, error) {
 	return &Updater{cfg: cfg, log: cfg.Log, f: f, engineOK: map[string]error{}}, nil
 }
 
-func (u *Updater) load() state {
+// ErrStateUnreadable means the release state exists but cannot be opened or understood. It is not a
+// fresh install: treating it as one would forget committed_seq and allow a downgrade.
+var ErrStateUnreadable = errors.New("the release state of this PC cannot be read")
+
+// load reads the release state. Only a state that does not exist is a fresh install.
+func (u *Updater) load() (state, error) {
 	var st state
 	b, err := u.cfg.Store.ReadSecret(secretRelease)
+	if errors.Is(err, store.ErrNotFound) {
+		return st, nil
+	}
 	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			u.log.Warn("release state unreadable; treating this as a fresh install", "err", err.Error())
-		}
-		return st
+		return st, fmt.Errorf("%w: %v", ErrStateUnreadable, err)
 	}
-	if json.Unmarshal(b, &st) != nil {
-		return state{}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return state{}, fmt.Errorf("%w: damaged", ErrStateUnreadable)
 	}
-	return st
+	return st, nil
+}
+
+// floor is the release a new one must not be older than: the higher of the committed one and the
+// one that is running, which may be on trial and not committed yet. The caller holds u.mu.
+func (u *Updater) floor(st state) (int64, string) {
+	seq, version := st.CommittedSeq, st.CommittedVersion
+	if u.manifest != nil && u.manifest.ReleaseSeq > seq {
+		seq, version = u.manifest.ReleaseSeq, u.manifest.Version
+	}
+	return seq, version
 }
 
 func (u *Updater) save(st state) error {
@@ -154,7 +172,7 @@ func (u *Updater) Unverified() bool {
 
 // Committed is the release sequence and version this PC is committed to.
 func (u *Updater) Committed() (int64, string) {
-	st := u.load()
+	st, _ := u.load()
 	return st.CommittedSeq, st.CommittedVersion
 }
 
@@ -192,7 +210,10 @@ func (u *Updater) verifyFiles(m *release.Manifest, prefix string) error {
 func (u *Updater) Startup() error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	st := u.load()
+	st, err := u.load()
+	if err != nil {
+		return err
+	}
 	v := u.cfg.Version
 	var raw, sig []byte
 	switch {
@@ -208,18 +229,23 @@ func (u *Updater) Startup() error {
 			}
 		}
 	default: // first start after the installer, or a version put here outside the updater
+		// manifest.json is written last (writeManifest), so without it there is no manifest, whatever
+		// else a crash left behind.
 		r, rerr := os.ReadFile(layout.ManifestFile(u.cfg.Root, v))
 		s, serr := os.ReadFile(layout.ManifestFile(u.cfg.Root, v) + ".minisig")
-		if rerr != nil || serr != nil {
+		if rerr != nil {
 			u.needFetch = true
 			u.log.Info("no manifest for this version on this PC yet; it will be fetched and checked", "version", v)
 			return nil
 		}
+		if serr != nil {
+			return fmt.Errorf("the manifest of %s has no signature beside it", v)
+		}
 		raw, sig, u.toCommit = r, s, true
 	}
-	m, err := release.Verify(raw, sig, u.cfg.Keys)
-	if err != nil {
-		return fmt.Errorf("the installed release does not verify: %w", err)
+	m, verr := release.Verify(raw, sig, u.cfg.Keys)
+	if verr != nil {
+		return fmt.Errorf("the installed release does not verify: %w", verr)
 	}
 	if m.Version != v {
 		return fmt.Errorf("the stored manifest is for %s, not for the running %s", m.Version, v)
@@ -252,7 +278,10 @@ func (u *Updater) Bootstrap(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("the manifest of this version %w", err)
 	}
-	st := u.load()
+	st, err := u.load()
+	if err != nil {
+		return err
+	}
 	if m.Version != v {
 		return errors.New("the published manifest is for another version")
 	}
@@ -272,12 +301,18 @@ func (u *Updater) Bootstrap(ctx context.Context) error {
 	return u.MarkHealthy()
 }
 
+// writeManifest stores the signed pair beside a version so that a crash cannot leave half of it:
+// manifest.json is the commit point. It is removed first and written last, so at any moment the
+// folder holds a whole pair, or no manifest at all, which simply means "not checked yet".
 func (u *Updater) writeManifest(m *release.Manifest, raw, sig []byte) error {
 	path := layout.ManifestFile(u.cfg.Root, m.Version)
-	if err := layout.WriteAtomic(path, raw); err != nil {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return layout.WriteAtomic(path+".minisig", sig)
+	if err := layout.WriteAtomic(path+".minisig", sig); err != nil {
+		return err
+	}
+	return layout.WriteAtomic(path, raw)
 }
 
 // MarkHealthy is called once the agent passed the health gate: it writes healthy.<version> for the
@@ -291,7 +326,10 @@ func (u *Updater) MarkHealthy() error {
 	if !u.toCommit || u.manifest == nil {
 		return nil
 	}
-	st := u.load()
+	st, err := u.load()
+	if err != nil {
+		return err
+	}
 	st.CommittedSeq, st.CommittedVersion, st.Manifest, st.Sig, st.Pending = u.manifest.ReleaseSeq, u.manifest.Version, u.raw, u.sig, nil
 	if err := u.save(st); err != nil {
 		return err
@@ -346,6 +384,72 @@ func (u *Updater) fetchVerified(ctx context.Context, version string) (*release.M
 	return m, raw, sig, nil
 }
 
+// CheckLatest is the daily check (§13, ruling B9), so a hacked hub cannot hide an update: it fetches
+// the manifest of the release GitHub calls latest, from the fixed prefix and never from the hub,
+// verifies it the same way as any update, and stores the version. It returns that version.
+func (u *Updater) CheckLatest(ctx context.Context) (string, error) {
+	raw, err := u.f.latestFile(ctx, "manifest.json", 4<<20)
+	if err != nil {
+		return "", fmt.Errorf("the latest manifest could not be fetched: %w", err)
+	}
+	sig, err := u.f.latestFile(ctx, "manifest.json.minisig", 4096)
+	if err != nil {
+		return "", fmt.Errorf("the latest signature could not be fetched: %w", err)
+	}
+	m, err := release.Verify(raw, sig, u.cfg.Keys)
+	if errors.Is(err, release.ErrUntrustedKey) { // a key rotation: the outgoing key signs too (ruling B20)
+		if old, oerr := u.f.latestFile(ctx, "manifest.json.old.minisig", 4096); oerr == nil {
+			m, err = release.Verify(raw, old, u.cfg.Keys)
+		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("the latest manifest was refused: %w", err)
+	}
+	if strings.Contains(m.Notes, "ROLLBACK TEST") {
+		return "", errors.New("the release marked latest is a rollback test; ignored")
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	st, err := u.load()
+	if err != nil {
+		return "", err
+	}
+	if m.ReleaseSeq < st.LatestSeq { // "latest" went back: keep what was verified before
+		return st.LatestVersion, nil
+	}
+	st.LatestVersion, st.LatestSeq = m.Version, m.ReleaseSeq
+	if err := u.save(st); err != nil {
+		return "", err
+	}
+	return m.Version, nil
+}
+
+// LatestVerified is the newest version the daily check verified, "" before the first success.
+func (u *Updater) LatestVerified() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	st, err := u.load()
+	if err != nil {
+		return ""
+	}
+	return st.LatestVersion
+}
+
+// UpdateAvailable is the verified latest version when it is newer than what this PC runs, else "".
+func (u *Updater) UpdateAvailable() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	st, err := u.load()
+	if err != nil || st.LatestVersion == "" || st.LatestVersion == u.cfg.Version {
+		return ""
+	}
+	floor, _ := u.floor(st)
+	if st.LatestSeq <= floor || !semverLess(u.cfg.Version, st.LatestVersion) {
+		return ""
+	}
+	return st.LatestVersion
+}
+
 func semverLess(a, b string) bool {
 	var x, y [3]int
 	fmt.Sscanf(a, "%d.%d.%d", &x[0], &x[1], &x[2])
@@ -394,9 +498,21 @@ func (u *Updater) Update(ctx context.Context, version string, progress Progress)
 	if m.Version != version {
 		return failf("the manifest is for version %s, not %s", m.Version, version)
 	}
-	st := u.load()
-	if err := release.CheckSeq(m, st.CommittedSeq, st.CommittedVersion); err != nil {
+	st, err := u.load()
+	if err != nil {
+		return failf("%v", err)
+	}
+	u.mu.Lock()
+	floorSeq, floorVersion := u.floor(st)
+	unverified := u.needFetch
+	u.mu.Unlock()
+	if err := release.CheckSeq(m, floorSeq, floorVersion); err != nil {
 		return failf("the release was refused: %v", err)
+	}
+	// A running version whose manifest could not be checked yet has no known sequence: until it does,
+	// its version number is the floor.
+	if unverified && semverLess(version, u.cfg.Version) {
+		return failf("the release was refused: %s is older than the running %s, whose signed manifest could not be checked yet", version, u.cfg.Version)
 	}
 	if hub := ""; u.cfg.HubVersion != nil && m.MinHubVersion != "" {
 		if hub = u.cfg.HubVersion(); release.ValidVersion(hub) && semverLess(hub, m.MinHubVersion) {
@@ -478,9 +594,21 @@ func (u *Updater) Update(ctx context.Context, version string, progress Progress)
 	if err := u.replaceLauncher(m); err != nil {
 		return failf("the launcher could not be replaced: %v", err)
 	}
-	st.Pending = &pending{Version: m.Version, Manifest: raw, Sig: sig}
-	if err := u.save(st); err != nil {
-		return failf("the pending release could not be recorded")
+	// The download took a while: a MarkHealthy may have committed meanwhile. Read the state again
+	// just before writing it, under the lock, and judge the release against what is there now.
+	u.mu.Lock()
+	cur, err := u.load()
+	if err == nil {
+		fs, fv := u.floor(cur)
+		err = release.CheckSeq(m, fs, fv)
+	}
+	if err == nil {
+		cur.Pending = &pending{Version: m.Version, Manifest: raw, Sig: sig}
+		err = u.save(cur)
+	}
+	u.mu.Unlock()
+	if err != nil {
+		return failf("the pending release could not be recorded: %v", err)
 	}
 	if u.cfg.StopEngine != nil {
 		u.cfg.StopEngine()

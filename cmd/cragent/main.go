@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -61,6 +62,37 @@ func env(name, def string) string {
 	return def
 }
 
+// devEnv reads a variable that only a debug build listens to (finding L7).
+func devEnv(name string) string {
+	if debugBuild {
+		return os.Getenv(name)
+	}
+	return ""
+}
+
+// debugOnlyFlags names the flags set that only a debug build accepts. In a release build the engine
+// comes from the install layout, the key from the pairing, the model from the hub's model list, and
+// the sandbox is not a flag (finding L7).
+func debugOnlyFlags(o options) []string {
+	var set []string
+	add := func(on bool, name string) {
+		if on {
+			set = append(set, name)
+		}
+	}
+	add(o.approve != "ask", "--approve")
+	add(o.hfBase != "", "--hf-base")
+	add(o.releaseBase != "", "--release-base")
+	add(o.engine != "", "--engine")
+	add(o.key != "", "--key")
+	add(o.model != "", "--model")
+	add(o.modelID != "", "--model-id")
+	add(o.load, "--load")
+	add(!o.lowIL, "--low-il=false")
+	add(o.noMemCap, "--no-mem-cap")
+	return set
+}
+
 type options struct {
 	home, hub, key, engine, model, modelID, modelsDir, pair, hfBase, approve, releaseBase string
 	load, lowIL, noMemCap, noTray, unpair, verbose                                        bool
@@ -72,23 +104,23 @@ func parseFlags() options {
 	flag.StringVar(&o.hub, "hub", env("CRAGENT_HUB", "wss://"+link.ProductionHost+"/agent"), "hub WebSocket URL a bare pairing code is used with")
 	flag.StringVar(&o.pair, "pair", "", "pair with the hub using this code or pairing string, then run")
 	flag.BoolVar(&o.unpair, "unpair", false, "forget this PC's machine key and exit")
-	flag.StringVar(&o.engine, "engine", env("CRAGENT_ENGINE", ""), "folder with llama-server.exe")
+	flag.StringVar(&o.engine, "engine", devEnv("CRAGENT_ENGINE"), "debug builds only: folder with llama-server.exe")
 	flag.StringVar(&o.modelsDir, "models-dir", "", "set the model folder (kept in the config)")
-	flag.BoolVar(&o.lowIL, "low-il", true, "start the engine with a low-integrity token (falls back if CUDA fails)")
-	flag.BoolVar(&o.noMemCap, "no-mem-cap", false, "do not cap the engine's job memory at RAM - 4 GiB")
+	flag.BoolVar(&o.lowIL, "low-il", true, "debug builds only can turn this off: start the engine with a low-integrity token")
+	flag.BoolVar(&o.noMemCap, "no-mem-cap", false, "debug builds only: do not cap the engine's job memory at RAM - 4 GiB")
 	flag.BoolVar(&o.noTray, "no-tray", false, "run as a console program without the tray icon")
 	flag.BoolVar(&o.verbose, "v", false, "debug logging")
 	// Development aids.
-	flag.StringVar(&o.key, "key", "", "development: connect with this machine key instead of the stored pairing (or env CRAGENT_KEY)")
-	flag.StringVar(&o.model, "model", env("CRAGENT_MODEL", ""), "development: a local .gguf outside the model folder")
-	flag.StringVar(&o.modelID, "model-id", "", "development: model id for --model (default: from the file name)")
-	flag.BoolVar(&o.load, "load", false, "development: load --model at start")
+	flag.StringVar(&o.key, "key", "", "debug builds only: connect with this machine key instead of the stored pairing (or env CRAGENT_KEY)")
+	flag.StringVar(&o.model, "model", devEnv("CRAGENT_MODEL"), "debug builds only: a local .gguf outside the model folder")
+	flag.StringVar(&o.modelID, "model-id", "", "debug builds only: model id for --model (default: from the file name)")
+	flag.BoolVar(&o.load, "load", false, "debug builds only: load --model at start")
 	flag.StringVar(&o.hfBase, "hf-base", "", "debug builds only: a local stand-in for huggingface.co")
 	flag.StringVar(&o.releaseBase, "release-base", "", "debug builds only: a local stand-in for the GitHub release downloads")
 	flag.StringVar(&o.approve, "approve", "ask", "debug builds only: ask | allow | deny for downloads outside the publisher allowlist")
 	flag.Parse()
 	if o.key == "" {
-		o.key = os.Getenv("CRAGENT_KEY")
+		o.key = devEnv("CRAGENT_KEY")
 	}
 	return o
 }
@@ -112,12 +144,13 @@ type app struct {
 	devKeyed bool
 	refresh  chan struct{}
 
-	root    string // the install folder, when this agent runs from one
-	managed bool
-	up      *updater.Updater
-	trayUp  atomic.Bool
-	quit    chan struct{}
-	code    int
+	available latestBox // the version the daily check offers, "" for none
+	root      string    // the install folder, when this agent runs from one
+	managed   bool
+	up        *updater.Updater
+	trayUp    atomic.Bool
+	quit      chan struct{}
+	code      int
 }
 
 func run() int {
@@ -143,19 +176,17 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "cannot open the agent's folder:", err)
 		return 2
 	}
-	logFile := openLog(st.LogPath())
-	if logFile != nil {
-		defer logFile.Close()
-	}
+	logFile := newLogWriter(st.LogPath())
+	defer logFile.Close()
 	level := slog.LevelInfo
 	if o.verbose {
 		level = slog.LevelDebug
 	}
-	log := slog.New(slog.NewJSONHandler(logWriter{logFile}, &slog.HandlerOptions{Level: level}))
+	log := slog.New(slog.NewJSONHandler(logFile, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
 
-	if !debugBuild && (o.approve != "ask" || o.hfBase != "" || o.releaseBase != "") {
-		log.Error("--approve, --hf-base and --release-base exist only in debug builds")
+	if set := debugOnlyFlags(o); !debugBuild && len(set) > 0 {
+		log.Error("these flags exist only in debug builds", "flags", strings.Join(set, " "))
 		return 2
 	}
 	if managed && layoutVersion != version {
@@ -197,7 +228,13 @@ func run() int {
 		root: root, managed: managed, quit: make(chan struct{}, 1)}
 	if err := ap.start(); err != nil {
 		log.Error("start failed", "err", err.Error())
-		return 1
+		// Exit 2: the launcher does not restart it. On trial the launcher reverts without any dialog;
+		// otherwise the host must learn why nothing runs (a build without a console has no other way).
+		ptr, perr := layout.ReadPointer(root)
+		if !o.noTray && !(managed && perr == nil && ptr.PendingSince != nil) {
+			ui.Error("CR Agent cannot start: " + err.Error() + ".\n\nIf this keeps happening, uninstall CR Agent and install it again.")
+		}
+		return 2
 	}
 	defer ap.stop()
 
@@ -211,7 +248,8 @@ func run() int {
 				log.Info("using the pairing this PC already has")
 			}
 		} else {
-			fmt.Fprintln(os.Stderr, "Paired as "+slug+".")
+			_ = slug
+			fmt.Fprintln(os.Stderr, "Paired.")
 		}
 	}
 
@@ -237,6 +275,17 @@ func run() int {
 	case <-ap.quit:
 	}
 	return ap.exitCode()
+}
+
+// latestBox holds a string for the tray, set by the daily check.
+type latestBox struct{ v atomic.Pointer[string] }
+
+func (b *latestBox) Store(s string) { b.v.Store(&s) }
+func (b *latestBox) Load() string {
+	if p := b.v.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // exit ends the agent with an exit code: 75 asks the launcher to start the version its pointer names.
@@ -309,6 +358,28 @@ func bootstrapDelay(try int) time.Duration {
 	}
 	return time.Hour
 }
+
+// pollLatest is the daily check of the signed latest release (§13, ruling B9): the hub has no part in
+// it, so a hacked hub cannot hide an update.
+func (ap *app) pollLatest() {
+	time.Sleep(time.Minute)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		v, err := ap.up.CheckLatest(ctx)
+		cancel()
+		if err != nil {
+			ap.log.Info("the daily check of the latest release found nothing usable", "err", err.Error())
+		} else {
+			ap.log.Info("daily check of the latest release", "latest", v, "offered", ap.up.UpdateAvailable())
+		}
+		ap.available.Store(ap.up.UpdateAvailable())
+		ap.requestRefresh()
+		time.Sleep(latestDelay(rand.Int64N(int64(time.Hour))))
+	}
+}
+
+// latestDelay is a day and some jitter, so PCs do not all ask at one moment.
+func latestDelay(jitter int64) time.Duration { return 24*time.Hour + time.Duration(jitter) }
 
 func (ap *app) signalQuit() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -404,6 +475,12 @@ func (ap *app) start() error {
 			}
 			return hw.GPUFree(ctx, index)
 		},
+		LatestVerified: func() string {
+			if ap.up != nil {
+				return ap.up.LatestVerified()
+			}
+			return ""
+		},
 		KeepAwake:    keepawake.New().Set,
 		OnChange:     ap.requestRefresh,
 		ResumedByHub: func() { ap.tr.Notify("Hosting resumed", "Sharing on this PC was resumed from the hub.") },
@@ -447,15 +524,15 @@ func (ap *app) start() error {
 		ap.up = up
 		cfg.Updater, cfg.RolledBack, cfg.EngineCheck = up, up.RolledBack, up.VerifyEngine
 		cfg.Restart = func() { ap.exit(layout.ExitRestart) }
-		if cfg.EngineDir == "" {
-			cfg.EngineDir = layout.EngineDir(ap.root, llamaTag)
-		}
+		cfg.EngineDir = layout.EngineDir(ap.root, llamaTag)
 	}
 	ap.a = agent.New(cfg)
 	ap.aRef.Store(ap.a)
 	if ap.up != nil {
+		ap.available.Store(ap.up.UpdateAvailable())
 		go ap.bootstrap()
 		go ap.healthGate()
+		go ap.pollLatest()
 	}
 	go ap.refreshLoop()
 	go ap.checkToken()
@@ -526,10 +603,8 @@ func (ap *app) trayState() tray.State {
 	paired := ap.paired()
 	in := ap.a.Snapshot(paired)
 	text, icon := status.Line(in)
-	s := tray.State{Status: text, Icon: icon, Paired: paired, Paused: in.Paused, ModelsDir: ap.mm.Dir(), Version: version}
-	if paired {
-		s.Slug = ap.st.Config().Slug
-	}
+	s := tray.State{Status: text, Icon: icon, Paired: paired, Paused: in.Paused, ModelsDir: ap.mm.Dir(), Version: version,
+		UpdateAvailable: ap.available.Load(), SandboxBlocked: ap.a.SandboxBlocked(), SandboxOff: ap.a.NormalIntegrity()}
 	if ap.q != nil {
 		s.Pending = ap.q.Pending()
 	}
@@ -605,7 +680,8 @@ func (ap *app) onAction(a tray.Action, arg string) {
 			ui.Error(pairingMessage(err))
 			return
 		}
-		ui.Info("This PC is now paired with the hub as " + slug + ".")
+		_ = slug
+		ui.Info("This PC is now paired with the hub.")
 	case tray.ActHFToken:
 		ap.setToken()
 	case tray.ActModelFolder:
@@ -623,13 +699,25 @@ func (ap *app) onAction(a tray.Action, arg string) {
 	case tray.ActAbout:
 		c := ap.st.Config()
 		text := "CR Agent " + version + "\nllama.cpp " + llamaTag
-		if c.Slug != "" {
-			text += "\nThis PC: " + c.Slug + " (key id " + c.KeyID + ")"
+		for _, k := range trust.Keys() {
+			text += "\nRelease key id: " + k.ID.String()
+		}
+		if c.KeyID != "" {
+			text += "\nThis PC's machine key id: " + c.KeyID
 		}
 		if ap.up != nil && ap.up.Unverified() {
 			text += "\nThis version's signed manifest could not be checked yet (offline, or the release is not published). Trying again."
 		}
 		ui.Info(text)
+	case tray.ActInstallUpdate:
+		if !layout.ValidVersion(arg) || !ui.Confirm("Install CR Agent "+arg+"?\n\nIt was checked against the release key. The agent restarts, and any answer running now stops.", "Install") {
+			return
+		}
+		if err := ap.a.InstallUpdate(arg); err != nil {
+			ui.Error("The update did not install: " + err.Error() + ".")
+		}
+	case tray.ActSandbox:
+		ap.toggleSandbox()
 	case tray.ActQuit:
 		ap.tr.Close()
 	case tray.ActPending:
@@ -641,6 +729,24 @@ func (ap *app) onAction(a tray.Action, arg string) {
 			ap.q.Open("")
 		}
 	}
+}
+
+// toggleSandbox is the host's own choice, on this PC, about running the engine outside its
+// low-integrity sandbox when CUDA does not work inside it. Nothing from the hub leads here.
+func (ap *app) toggleSandbox() {
+	off := !ap.a.NormalIntegrity()
+	if off && !ui.Confirm("The engine could not use the GPU in its low-integrity sandbox on this PC.\n\n"+
+		"Without the sandbox, a malicious model that attacks the engine could change your files, not only read them. "+
+		"Allow this only if you trust the models you load.\n\nRun the engine without the sandbox on this PC?", "Run without") {
+		return
+	}
+	if err := ap.st.Update(func(c *store.Config) { c.EngineNormalIntegrity = off }); err != nil {
+		ui.Error("The choice could not be saved on this PC.")
+		return
+	}
+	ap.a.AllowNormalIntegrity(off)
+	ap.log.Warn("the host changed the engine's sandbox", "normal_integrity", off)
+	ui.Info("This takes effect the next time a model loads.")
 }
 
 func (ap *app) setToken() {
@@ -709,28 +815,69 @@ type allowAll struct{}
 
 func (allowAll) Ask(context.Context, models.Prompt) bool { return true }
 
-// logWriter writes each line to the log file and, best effort, to stderr.
-type logWriter struct{ f *os.File }
+// maxLogSize is when the log moves to agent.log.1, while the agent runs too: a talkative hub must
+// not be able to fill the disk (finding L4).
+const maxLogSize = 10 << 20
 
-func (w logWriter) Write(p []byte) (int, error) {
+// logWriter writes each line to the log file and, best effort, to stderr.
+type logWriter struct {
+	mu   sync.Mutex
+	path string
+	f    *os.File
+	size int64
+}
+
+// newLogWriter opens the log for appending. The agent runs on without a log if that fails.
+func newLogWriter(path string) *logWriter {
+	w := &logWriter{path: path}
+	w.open()
+	return w
+}
+
+func (w *logWriter) open() {
+	if st, err := os.Stat(w.path); err == nil && st.Size() > maxLogSize {
+		os.Remove(w.path + ".1")
+		os.Rename(w.path, w.path+".1")
+	}
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		w.f, w.size = nil, 0
+		return
+	}
+	w.f, w.size = f, 0
+	if st, err := f.Stat(); err == nil {
+		w.size = st.Size()
+	}
+}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.f != nil {
-		w.f.Write(p)
+		if w.size+int64(len(p)) > maxLogSize {
+			w.f.Close()
+			if st, err := os.Stat(w.path); err == nil && st.Size() > 0 {
+				os.Remove(w.path + ".1")
+				os.Rename(w.path, w.path+".1")
+			}
+			w.open()
+		}
+		if w.f != nil {
+			n, _ := w.f.Write(p)
+			w.size += int64(n)
+		}
 	}
 	os.Stderr.Write(p) // fails silently in a build without a console
 	return len(p), nil
 }
 
-// openLog opens the log for appending; a log over 10 MB is kept as agent.log.1 first.
-func openLog(path string) *os.File {
-	if st, err := os.Stat(path); err == nil && st.Size() > 10<<20 {
-		os.Remove(path + ".1")
-		os.Rename(path, path+".1")
+func (w *logWriter) Close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		w.f.Close()
+		w.f = nil
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil
-	}
-	return f
 }
 
 // deriveID lowercases the file name without .gguf and keeps [a-z0-9._-].

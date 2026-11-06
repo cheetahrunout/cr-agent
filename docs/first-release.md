@@ -1,226 +1,138 @@
-# The first release: what the owner does
+# The first real release: 0.2.0, 0.2.1 and 0.2.2
 
-This is the one job only the owner can do: making the signing key and signing the releases. No Go knowledge is needed. It takes
-about 10 minutes for the key, and about 30 minutes for the signing once the releases are built.
+Release files are built on this PC from the local checkout, the owner signs them here, and GitHub only carries them (ruling B62).
 
-**How it works in one paragraph.** Your passphrase is the private key. Nothing is stored anywhere. Every agent carries the public half
-and refuses any update that was not signed with your passphrase. If the passphrase ever leaks, or everybody forgets it, every PC has
-to reinstall the agent, so choose it well and make sure it cannot be forgotten.
+The old `v0.1.x` drafts and tags on GitHub are unsigned leftovers. They are never to be signed or published. The owner may delete them.
 
-**Rules for the passphrase.**
+## What the owner does
 
-- At least 10 characters. Longer is stronger: the public key is public, so anyone can try guesses against it on their own computers, for
-  as long as they like. Avoid names, dates, song lines and common phrases.
-- Type it only into `signtool`, in a terminal window on this PC. Never in a chat, a browser, a file or a command line.
-- Capital letters and extra spaces do not matter: `Amber  COBALT` and `amber cobalt` give the same key.
-- Nothing appears on screen while you type. That is correct. Type it and press Enter.
+Four short steps. About 5 minutes.
 
-**Where to type the commands.** Start menu → *Terminal*. Every command below goes into that window, one at a time. Do not run them
-through Claude or any other tool: the passphrase has to come from your own keyboard.
+**(a) Wait for the lead to say the files are ready**, in `C:\Users\Admin\Desktop\AI\signing\0.2.0`, `0.2.1` and `0.2.2`. The lead also tells
+you the SHA-256 of the signing tool.
 
----
+**(b) Sign three times.** Start menu → *Terminal*. Paste one line at a time. Each asks for the passphrase once and takes about 25 seconds.
+Nothing appears on screen while you type: that is correct.
 
-## Part 1: make the key
+    C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.2.0 -first
+    C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.2.1 -prev C:\Users\Admin\Desktop\AI\signing\0.2.0\manifest.json
+    C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.2.2 -prev C:\Users\Admin\Desktop\AI\signing\0.2.1\manifest.json
 
-### Step 1. Build the signing tool
+**Before you type anything**, the first line printed is `this tool: sha256 …`. It must be the value the lead told you (it is also in
+`signtool.exe.txt` beside the tool). If it is not, press Ctrl+C and tell the lead.
 
-    cd C:\Users\Admin\Desktop\AI\cr-agent
-    git pull
-    pwsh -File scripts\build-signtool.ps1
+**Success looks like** `signed: version 0.2.0, release_seq 1, key <your key id>`, then `0.2.1` with `release_seq 2`, then `0.2.2` with
+`release_seq 3`. Each also prints a `notes:` line with the commit it was built from.
 
-**Success looks like:**
+**Check the notes.** Only 0.2.2 says `ROLLBACK TEST`. If 0.2.0 or 0.2.1 says it, or 0.2.2 does not, **stop** and tell the lead.
 
-    built C:\Users\Admin\Desktop\AI\cr-agent\build\signtool.exe
-    keys it trusts: none yet. It can run 'pubkey'; it cannot sign.
+**(c) Verify.**
 
-That second line is right at this stage. No key exists yet, so this copy of the tool trusts nothing and can sign nothing. Making a key
-needs no trust, so `pubkey` works.
+    C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe verify -dist C:\Users\Admin\Desktop\AI\signing\0.2.0
+    C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe verify -dist C:\Users\Admin\Desktop\AI\signing\0.2.1
+    C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe verify -dist C:\Users\Admin\Desktop\AI\signing\0.2.2
 
-### Step 2. Make the key
+**Success looks like** `ok: version 0.2.0, release_seq 1, signed by <your key id>, 58 files in 3 archives match`. The file count may differ.
 
-    .\build\signtool.exe pubkey
+**(d) Tell the lead.** The lead publishes. You are done.
 
-It asks for the passphrase twice. Then it takes a few seconds and uses 1 GB of memory, on purpose.
-
-**Success looks like:**
-
-    public key: RWQ...
-    key id:     <16 letters and digits>
-
-    Entry for protocol/release-keys.json:
-        {
-          "added": "2026-11-06",
-          "key_id": "<16 letters and digits>",
-          "public_key": "RWQ...",
-          "status": "current"
-        }
-
-| If you see | It means | Do this |
-| --- | --- | --- |
-| `the two entries differ` | a typo in one of the two | run it again |
-| `the passphrase must be at least 10 characters` | too short | choose a longer one |
-| `the passphrase is typed at a console` | not in a real terminal | use *Terminal* from the Start menu |
-
-### Step 3. Send the lead that entry
-
-Send the part from `{` to `}`. It is public, so any channel is fine. **Never send the passphrase.**
-
-Make sure the second admin knows it too, because it cannot be recovered.
-
----
-
-## Part 2: the lead builds the releases
-
-You wait for this part. The lead:
-
-1. adds your entry to `protocol/release-keys.json` and pushes it;
-2. pushes the tags `v0.1.0` and `v0.1.1`, one build each;
-3. starts the rollback build, which is not a tag:
-
-       gh workflow run release.yml --repo cheetahrunout/cr-agent --ref main -f version=0.1.2 -f rollback_test=true
-
-**About 0.1.2.** Ruling B27 needs a release that fails on purpose, to prove that the launcher takes it back. It is the same source as
-0.1.1. Only this one build gets a link flag (`-X main.sabotage=unhealthy-0.1.2`) that keeps it from ever reporting healthy. Nothing
-changes on `main`, so it cannot ship by accident. A normal tag build never sets the flag, and the flag names one version, so it has
-no effect on any other. The notes of that manifest say `ROLLBACK TEST`, and `signtool` shows them when you sign.
-
-The lead tells you when three drafts exist. You can check for yourself:
-
-    gh release list --repo cheetahrunout/cr-agent
-
-**Success looks like:** three rows that say `Draft`, for v0.1.0, v0.1.1 and v0.1.2. Agents cannot see a draft, and nothing on them is
-signed yet.
-
----
-
-## Part 3: sign and publish
-
-### Step 4. Rebuild the signing tool, now with your key in it
-
-    cd C:\Users\Admin\Desktop\AI\cr-agent
-    git pull
-    pwsh -File scripts\build-signtool.ps1
-    .\build\signtool.exe trust-check
-
-**Success looks like:**
-
-    keys it trusts: 1, from protocol\release-keys.json
-    ok: 1 production key(s), no test key
-
-### Step 5. Download the three drafts
-
-About 3.6 GB in all.
-
-    gh release download v0.1.0 --repo cheetahrunout/cr-agent --dir C:\Users\Admin\Desktop\AI\signing\0.1.0
-    gh release download v0.1.1 --repo cheetahrunout/cr-agent --dir C:\Users\Admin\Desktop\AI\signing\0.1.1
-    gh release download v0.1.2 --repo cheetahrunout/cr-agent --dir C:\Users\Admin\Desktop\AI\signing\0.1.2
-
-**Success looks like:** each folder holds five files: `agent-….zip`, `engine-….zip`, `CRAgent-Setup-….exe`, `manifest.json` and
-`SHA256SUMS.txt`.
-
-If `gh` says it cannot find the release, download the five files from the draft on the
-[Releases page](https://github.com/cheetahrunout/cr-agent/releases) into those same folders.
-
-### Step 6. Test the engine on this PC's GPU
-
-Once is enough, because all three releases carry the same engine.
-
-    pwsh -File scripts\smoke-gpu.ps1 -Dist C:\Users\Admin\Desktop\AI\signing\0.1.0
-
-**Success looks like:** the last line is `SMOKE TEST OK`. It takes under a minute. If it says anything else, stop and send the lead
-the output.
-
-### Step 7. Sign, in this order
-
-Each command asks for the passphrase once and takes about 25 seconds. It first hashes every file again and refuses if anything
-differs from the manifest.
-
-    .\build\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.1.0 -first
-    .\build\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.1.1 -prev C:\Users\Admin\Desktop\AI\signing\0.1.0\manifest.json
-    .\build\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.1.2 -prev C:\Users\Admin\Desktop\AI\signing\0.1.1\manifest.json
-
-**Success looks like** `signed: version 0.1.0, release_seq 1, key <your key id>`, then `0.1.1` with `release_seq 2`, then `0.1.2` with
-`release_seq 3`.
-
-**Check the notes.** Only 0.1.2 prints a line `notes: ROLLBACK TEST…`. If 0.1.0 or 0.1.1 prints it, or 0.1.2 does not, **stop**,
-upload nothing and tell the lead.
+### If something goes wrong
 
 | If you see | It means | Do this |
 | --- | --- | --- |
 | `this passphrase gives key …, which is not in the trust list … a typo` | a typo. Nothing was signed | run the same command again |
-| the same message, three careful tries in a row | this is not the passphrase of the key you sent | stop and tell the lead. Nothing is published yet, so a new key costs only a rebuild |
-| `this signtool was built before any key was in …` | Step 4 was skipped | do Step 4, then sign again |
-| `the folder is not what the manifest says` | a file is damaged or was changed | delete that version's folder, repeat Step 5 for it. If it happens again, stop and tell the lead |
-| `the previous manifest does not verify` | the `-prev` folder is wrong or was not signed | sign the previous version first |
+| the same message, three careful tries in a row | this is not the passphrase of the key in the list | stop and tell the lead |
+| `the passphrase must be at least 10 characters` | too short, so certainly a typo | run the same command again |
+| `the passphrase is typed at a console` | not in a real terminal | use *Terminal* from the Start menu |
+| `the folder is not what the manifest says` | a file was changed after the build. Nothing was signed | stop and tell the lead |
+| `the previous manifest does not verify` | the `-prev` version was not signed yet | sign the previous version first |
 | `version … is already published` | `-prev` names this same version | check the command |
 
-If anything goes wrong before you upload, run the same command again. Signing twice does no harm.
+Before the lead publishes, running a `sign` command again does no harm. After publishing, never sign these versions again.
 
-Then check all three:
+## The passphrase
 
-    .\build\signtool.exe verify -dist C:\Users\Admin\Desktop\AI\signing\0.1.0
-    .\build\signtool.exe verify -dist C:\Users\Admin\Desktop\AI\signing\0.1.1
-    .\build\signtool.exe verify -dist C:\Users\Admin\Desktop\AI\signing\0.1.2
+**Key rules.**
 
-**Success looks like** `ok: version 0.1.0, release_seq 1, signed by <your key id>, 58 files in 3 archives match`. The file count may differ.
+- At least 10 characters (ruling B61). Longer is stronger: the public key is public, so anyone can try guesses against it on their own
+  computers, for as long as they like. Avoid names, dates, song lines and common phrases.
+- Type it only into `signtool.exe` in `C:\Users\Admin\Desktop\AI\signing-tool`, in a terminal window on this PC. Never in a chat, a browser,
+  a file or a command line. Do not run the commands through Claude or any other tool: the passphrase comes from your own keyboard.
+- Capital letters and extra spaces do not matter: `Amber  COBALT` and `amber cobalt` give the same key.
+- Make sure the second admin knows it too, because it cannot be recovered.
 
-### Step 8. Upload the signatures
+**What it protects against.** A signed release is the only thing an agent will install. So someone who takes over the hub, the GitHub
+repository, CI or the download path cannot put their own program on a friend's PC: without the passphrase they have no signature, and
+agents refuse the update. They also cannot send a PC back to an older signed release.
 
-    gh release upload v0.1.0 C:\Users\Admin\Desktop\AI\signing\0.1.0\manifest.json C:\Users\Admin\Desktop\AI\signing\0.1.0\manifest.json.minisig --clobber --repo cheetahrunout/cr-agent
-    gh release upload v0.1.1 C:\Users\Admin\Desktop\AI\signing\0.1.1\manifest.json C:\Users\Admin\Desktop\AI\signing\0.1.1\manifest.json.minisig --clobber --repo cheetahrunout/cr-agent
-    gh release upload v0.1.2 C:\Users\Admin\Desktop\AI\signing\0.1.2\manifest.json C:\Users\Admin\Desktop\AI\signing\0.1.2\manifest.json.minisig --clobber --repo cheetahrunout/cr-agent
+**What it does not protect against.**
 
-**Success looks like:** no error. `--clobber` replaces the unsigned manifest with the signed one.
-
-### Step 9. Publish
-
-Publish in this order. 0.1.2 is a prerelease and must never be marked latest.
-
-    gh release edit v0.1.0 --draft=false --repo cheetahrunout/cr-agent
-    gh release edit v0.1.1 --draft=false --latest --repo cheetahrunout/cr-agent
-    gh release edit v0.1.2 --draft=false --prerelease --latest=false --repo cheetahrunout/cr-agent
-
-Check that the signed manifests can be fetched the way an agent fetches them:
-
-    curl.exe -sIL -o NUL -w "%{http_code}\n" https://github.com/cheetahrunout/cr-agent/releases/download/v0.1.0/manifest.json.minisig
-    curl.exe -sIL -o NUL -w "%{http_code}\n" https://github.com/cheetahrunout/cr-agent/releases/download/v0.1.1/manifest.json.minisig
-    curl.exe -sIL -o NUL -w "%{http_code}\n" https://github.com/cheetahrunout/cr-agent/releases/download/v0.1.2/manifest.json.minisig
-
-**Success looks like:** `200`, three times. Publishing 0.1.2 creates its tag, and that may start a short workflow run. It ends with
-the notice "a release exists already; nothing to build". That is correct.
-
-**After publishing, never sign or upload to these releases again.**
-
-### Step 10. Tell the lead, and share the two facts
-
-Tell the lead the releases are up. Send friends, by a channel other than the hub and GitHub, so they can check their download:
-
-- your key id;
-- the SHA-256 of the installer, from the line for `CRAgent-Setup-0.1.1.exe` in
-  `C:\Users\Admin\Desktop\AI\signing\0.1.1\SHA256SUMS.txt`.
-
-The `signing` folder holds nothing secret, and you can delete it once the lead has confirmed that the releases work.
+- It vouches for what was built on this PC. If this PC or this checkout is compromised when the release is built, the signature seals the
+  bad files. That is why the lead reviews the commit and why a release is built only from a clean tree.
+- If the program you type into is bad, it has your passphrase. That is why `signtool.exe` sits outside the repository, is built once, and is
+  not rebuilt just before signing.
+- It does not make models safe. A model file runs inside the engine, whose sandbox limits it but does not make it harmless
+  (`docs/engine-sandbox.md`).
+- It says nothing about the first install: a friend's first download is checked only by comparing the hash and key id you share.
+- A leak cannot be repaired by rotating (ruling B20). A leaked or lost passphrase means a new key, a new installer and a reinstall on
+  every PC. Tell the lead at once.
 
 ---
 
-## Part 4: what the lead does next
+## What the lead does
 
-Not the owner's job. Listed so that nothing falls between two chairs.
+Not the owner's job. In order.
 
-1. Paste the signed manifests of 0.1.0 and 0.1.1 into the hub's admin page. Paste 0.1.2 only for the rollback test, and press
-   *Withdraw* on it straight after: until then the hub offers it to every machine on an older version and shows it on the download page.
-2. Run the B27 test on one PC: install 0.1.0, press *Update* to 0.1.1, then to 0.1.2. Within 2 minutes the launcher should bring 0.1.1
-   back, and the hub should show the update as failed. Then ask for `update{0.1.0}`: it must be refused with "release_seq 1 is older
-   than the installed 2". This needs no new signature, because the signed 0.1.0 is already an old, valid release.
+**1. Review and commit.** Everything below runs from a clean tree at the reviewed commit.
 
-The real installer's Start menu shortcut, autostart entry and uninstaller were not exercised in rehearsal, so that install is their
-first run. Check them there.
+**2. The signing tool, once.**
+
+    pwsh -File scripts\build-signtool.ps1
+
+It prints the commit and SHA-256 and writes them beside the tool, in `signtool.exe.txt`. The tool prints its own SHA-256 too, so tell the owner
+the value. It refuses to replace the tool unless told to: rebuilding is a separate
+reviewed step, after reading the diff of `cmd/signtool`, `internal/sign`, `internal/release`, `internal/trust`, `protocol` and `scripts`
+(`-Rebuild`). Never in the session where the passphrase is typed.
+
+**3. Build the three folders.** Each refuses a dirty tree, prints the commit, and refuses engine zips that do not match `engine.lock`.
+
+    pwsh -File scripts\build-release.ps1 -Version 0.2.0 -Out C:\Users\Admin\Desktop\AI\signing\0.2.0
+    pwsh -File scripts\build-release.ps1 -Version 0.2.1 -Out C:\Users\Admin\Desktop\AI\signing\0.2.1
+    pwsh -File scripts\build-release.ps1 -Version 0.2.2 -RollbackTest -Out C:\Users\Admin\Desktop\AI\signing\0.2.2
+
+0.2.2 is the same source with one link flag (`-X main.sabotage=unhealthy-0.2.2`) that keeps it from ever reporting healthy, so the launcher
+has something to take back (ruling B27). Nothing changes in the source, and the flag has no effect on any other version.
+
+**4. Smoke test the built files.** Never in the session where the passphrase is typed.
+
+    pwsh -File scripts\smoke-gpu.ps1 -Dist C:\Users\Admin\Desktop\AI\signing\0.2.0
+
+It runs nothing until every file of the engine archive has matched the official zips, which are checked against `engine.lock`.
+
+**5. The owner signs** (above).
+
+**6. Publish, in this order.** Each checks the signature and re-hashes everything first, and refuses an unsigned folder. 0.2.2 goes up as a
+prerelease, never as latest, so the agents' daily look at the latest release cannot see it.
+
+    pwsh -File scripts\publish-release.ps1 -Dist C:\Users\Admin\Desktop\AI\signing\0.2.0 -Version 0.2.0
+    pwsh -File scripts\publish-release.ps1 -Dist C:\Users\Admin\Desktop\AI\signing\0.2.1 -Version 0.2.1
+    pwsh -File scripts\publish-release.ps1 -Dist C:\Users\Admin\Desktop\AI\signing\0.2.2 -Version 0.2.2
+
+A new tag starts `release.yml`, which only checks that it builds and tests on GitHub too. It publishes nothing.
+
+**7. Hub and friends.**
+
+- Paste the signed manifests of 0.2.0 and 0.2.1 into the hub's admin page. Paste 0.2.2 only for the rollback test, and press *Withdraw* on it
+  straight after: until then the hub offers it to every machine on an older version and shows it on the download page.
+- Share by a channel other than the hub and GitHub: the key id, and the SHA-256 of `CRAgent-Setup-0.2.1.exe` from that folder's
+  `SHA256SUMS.txt`.
+
+**8. The B27 test on one PC.** Install 0.2.0, press *Update* to 0.2.1, then to 0.2.2. Within 2 minutes the launcher should bring 0.2.1 back and
+the hub should show the update as failed. Then ask for `update{0.2.0}`: it must be refused with "release_seq 1 is older than the installed 2".
+This needs no new signature. That install is also the first run of the real installer's Start menu shortcut, autostart entry and
+uninstaller, so check them there.
 
 ## Later releases
 
-A tag `v<x.y.z>` builds a draft. Then repeat Steps 5 to 9 for that one version, with `-prev` naming the newest published manifest,
-even if that is 0.1.2. Step 6 is needed only when `engine.lock` changed.
-
-## If the passphrase leaks or is lost
-
-It cannot be rotated away (ruling B20). It means a new key, a new installer, and a reinstall on every PC. Tell the lead at once.
+Steps 3 to 7 for that one version, with `-prev` naming the newest published manifest, even if that is 0.2.2. Step 4 is needed only when
+`engine.lock` changed. Rebuild the signing tool only when its code changed, after reading the diff.

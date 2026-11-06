@@ -74,11 +74,11 @@ func Verify(root, version string, keys []trust.Key) error {
 	}
 	raw, rerr := os.ReadFile(layout.ManifestFile(root, version))
 	sig, serr := os.ReadFile(layout.ManifestFile(root, version) + ".minisig")
-	if errors.Is(rerr, os.ErrNotExist) && errors.Is(serr, os.ErrNotExist) {
+	if errors.Is(rerr, os.ErrNotExist) { // manifest.json is written last: no manifest yet, whatever else is there
 		return nil
 	}
 	if rerr != nil || serr != nil {
-		return fmt.Errorf("version %s has half a manifest", version)
+		return fmt.Errorf("version %s has a manifest without a signature", version)
 	}
 	m, err := release.Verify(raw, sig, keys)
 	if err != nil {

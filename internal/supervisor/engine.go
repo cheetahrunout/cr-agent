@@ -29,6 +29,7 @@ type Config struct {
 	Alias     string
 	Settings  protocol.Settings
 	LowIL     bool
+	GPUSelect string        // "" or "all": every GPU; "0".."7": only that one (CUDA_VISIBLE_DEVICES)
 	MemLimit  uint64        // job memory cap, 0 = none
 	Deadline  time.Duration // load deadline (ruling B28: 5 min)
 	Log       *slog.Logger
@@ -50,6 +51,11 @@ type Engine struct {
 	pumpDone   chan struct{}
 }
 
+// ErrLowILUnavailable means Windows refused to create the process with the low-integrity token, for
+// a reason of the token itself, before any of the child ran. It is the only failure after which the
+// agent may start the engine at normal integrity: nothing a model does can cause it.
+var ErrLowILUnavailable = errors.New("the low-integrity token cannot be used on this PC")
+
 // ErrEngineExited is returned when llama-server exits before it is healthy.
 var ErrEngineExited = errors.New("engine exited before it was healthy")
 
@@ -58,6 +64,9 @@ func Start(ctx context.Context, c Config) (*Engine, error) {
 	log := c.Log
 	if log == nil {
 		log = slog.Default()
+	}
+	if c.EngineDir == "" {
+		return nil, errors.New("no engine folder: this copy of the agent was not started from its install folder")
 	}
 	dir, err := filepath.Abs(c.EngineDir)
 	if err != nil {
@@ -79,7 +88,7 @@ func Start(ctx context.Context, c Config) (*Engine, error) {
 	}
 
 	t0 := time.Now()
-	p, err := spawn(spawnOptions{Exe: exe, Args: BuildArgs(l), Dir: dir, LowIL: c.LowIL, MemLimit: c.MemLimit})
+	p, err := spawn(spawnOptions{Exe: exe, Args: BuildArgs(l), Dir: dir, LowIL: c.LowIL, MemLimit: c.MemLimit, GPUSelect: c.GPUSelect})
 	if err != nil {
 		return nil, err
 	}

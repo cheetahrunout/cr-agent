@@ -85,6 +85,8 @@ type Config struct {
 	Updater Updater
 	// Restart is called after an update was installed: the process exits so the launcher starts the new version.
 	Restart func()
+	// LatestVerified is the newest version the daily check verified, reported in hello.
+	LatestVerified func() string
 	// RolledBack names, once, a version the launcher reverted before this start.
 	RolledBack func() string
 	// EngineCheck verifies the engine files against the signed release before they are run; nil: no check.
@@ -105,31 +107,33 @@ type Agent struct {
 	log   *slog.Logger
 	relay *relay.Relay
 
-	mu           sync.Mutex
-	sess         *link.Session
-	mode         string
-	state        string
-	engine       Engine
-	loadedID     string
-	settings     *protocol.Settings
-	engineErr    string
-	lastDisc     string
-	loading      bool
-	stopping     bool
-	paused       bool
-	sleeping     bool
-	config       protocol.ConfigArgs
-	lowILResult  string
-	hubVersion   string
-	update       *protocol.UpdateStatus // set while an update runs or after one failed
-	updating     bool
-	attempts     int       // link connection attempts since Connect
-	lastOnline   time.Time // last moment the link was connected (or the engine was loaded)
-	lastActivity time.Time // last moment a request ran (or the engine was loaded)
-	stopTick     chan struct{}
-	tickOnce     sync.Once
-	cmdJobs      map[string]string             // download command id → model id
-	inspects     map[string]context.CancelFunc // inspect command id → cancel
+	mu                sync.Mutex
+	sess              *link.Session
+	mode              string
+	state             string
+	engine            Engine
+	loadedID          string
+	settings          *protocol.Settings
+	engineErr         string
+	lastDisc          string
+	loading           bool
+	stopping          bool
+	paused            bool
+	sleeping          bool
+	config            protocol.ConfigArgs
+	lowILResult       string
+	sandboxBlocked    bool // CUDA failed under low integrity: the tray offers the opt-in
+	normalIntegrityOK bool // the host clicked the opt-in; remembered per PC by the caller
+	hubVersion        string
+	update            *protocol.UpdateStatus // set while an update runs or after one failed
+	updating          bool
+	attempts          int       // link connection attempts since Connect
+	lastOnline        time.Time // last moment the link was connected (or the engine was loaded)
+	lastActivity      time.Time // last moment a request ran (or the engine was loaded)
+	stopTick          chan struct{}
+	tickOnce          sync.Once
+	cmdJobs           map[string]string             // download command id → model id
+	inspects          map[string]context.CancelFunc // inspect command id → cancel
 
 	linkMu     sync.Mutex
 	linkCancel context.CancelFunc
@@ -185,6 +189,11 @@ func New(cfg Config) *Agent {
 			n := c.IdleUnloadMin
 			a.config.IdleUnloadMin = &n
 		}
+		if c.GPUSelect != "" {
+			g := c.GPUSelect
+			a.config.GPUSelect = &g
+		}
+		a.normalIntegrityOK = c.EngineNormalIntegrity
 	}
 	if a.paused && cfg.Models != nil {
 		cfg.Models.SetPaused(true)
@@ -361,6 +370,9 @@ func (a *Agent) Hello() *protocol.Hello {
 	if a.cfg.HFToken != nil {
 		h.HFToken = a.cfg.HFToken()
 	}
+	if a.cfg.LatestVerified != nil {
+		h.LatestVerified = a.cfg.LatestVerified()
+	}
 	if a.state == protocol.EngineLoaded || a.state == protocol.EngineLoading {
 		h.ModelID = a.loadedID
 		h.SettingsInUse = a.settings
@@ -429,10 +441,10 @@ func (a *Agent) OnFrame(s *link.Session, f protocol.Frame) {
 		}
 	case *protocol.Cancel:
 		if !a.cancelID(f.ID) {
-			a.log.Info("cancel for an unknown id dropped", "id", f.ID)
+			a.log.Info("cancel for an unknown id dropped", "id", link.Clip(f.ID))
 		}
 	case *protocol.ReqBody:
-		a.log.Info("req.body dropped: chunked bodies are not supported yet", "id", f.ID)
+		a.log.Info("req.body dropped: chunked bodies are not supported yet", "id", link.Clip(f.ID))
 	case *protocol.Cmd:
 		go a.handleCmd(s, f)
 	}
@@ -612,31 +624,8 @@ func (a *Agent) cmdUpdate(s *link.Session, id, version string) {
 	a.updating = true
 	a.mu.Unlock()
 	_ = s.Send(&protocol.CmdAck{ID: id})
-	lastState, lastPct := "", -1.0
-	progress := func(state string, pct float64) {
-		whole := float64(int(pct))
-		if state == lastState && whole == lastPct {
-			return
-		}
-		lastState, lastPct = state, whole
-		a.mu.Lock()
-		a.update = &protocol.UpdateStatus{State: state, Pct: &whole, Version: version}
-		a.mu.Unlock()
-		a.sendStatus(false)
-	}
-	// The update goes on if the socket drops: it is the agent's own job, like a download.
-	err := a.cfg.Updater.Update(context.Background(), version, progress)
-	a.mu.Lock()
-	a.updating = false
+	err := a.runUpdate(version)
 	var ue *updater.Error
-	switch {
-	case err == nil:
-	case errors.Is(err, updater.ErrAlreadyInstalled):
-		a.update = nil
-	default:
-		a.update = &protocol.UpdateStatus{State: "failed", Version: version}
-	}
-	a.mu.Unlock()
 	switch {
 	case err == nil:
 		a.log.Info("update installed", "version", version)
@@ -656,6 +645,65 @@ func (a *Agent) cmdUpdate(s *link.Session, id, version string) {
 		a.sendStatus(false)
 		a.cmdErr(s, id, protocol.ErrUpdateFailed, "", "the update failed")
 	}
+}
+
+// InstallUpdate is the tray's *Install update* (ruling B9): the host starts it on the PC, with no hub
+// involved, for the version the daily check verified. On success the agent restarts into it.
+func (a *Agent) InstallUpdate(version string) error {
+	if a.cfg.Updater == nil {
+		return errors.New("this copy of the agent was not installed by the installer")
+	}
+	a.mu.Lock()
+	if a.updating {
+		a.mu.Unlock()
+		return errors.New("an update is already running")
+	}
+	a.updating = true
+	a.mu.Unlock()
+	err := a.runUpdate(version)
+	if errors.Is(err, updater.ErrAlreadyInstalled) {
+		a.sendStatus(false)
+		return nil
+	}
+	if err != nil {
+		a.log.Warn("update from the tray failed", "version", version, "err", err.Error())
+		a.sendStatus(false)
+		return err
+	}
+	a.log.Info("update installed from the tray", "version", version)
+	if a.cfg.Restart != nil {
+		a.cfg.Restart()
+	}
+	return nil
+}
+
+// runUpdate runs the updater with progress as status frames. The caller set a.updating.
+func (a *Agent) runUpdate(version string) error {
+	lastState, lastPct := "", -1.0
+	progress := func(state string, pct float64) {
+		whole := float64(int(pct))
+		if state == lastState && whole == lastPct {
+			return
+		}
+		lastState, lastPct = state, whole
+		a.mu.Lock()
+		a.update = &protocol.UpdateStatus{State: state, Pct: &whole, Version: version}
+		a.mu.Unlock()
+		a.sendStatus(false)
+	}
+	// The update goes on if the socket drops: it is the agent's own job, like a download.
+	err := a.cfg.Updater.Update(context.Background(), version, progress)
+	a.mu.Lock()
+	a.updating = false
+	switch {
+	case err == nil:
+	case errors.Is(err, updater.ErrAlreadyInstalled):
+		a.update = nil
+	default:
+		a.update = &protocol.UpdateStatus{State: "failed", Version: version}
+	}
+	a.mu.Unlock()
+	return err
 }
 
 // HubVersion is the hub's version from the last welcome.
@@ -684,6 +732,7 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		a.cmdErr(s, id, protocol.ErrBadSetting, fe.Field, fe.Msg)
 		return
 	}
+	_ = s.Send(&protocol.CmdAck{ID: id}) // before the first load's hash, which can take a minute
 	path := ""
 	switch {
 	case a.cfg.LocalModelID != "" && args.ModelID == a.cfg.LocalModelID:
@@ -708,14 +757,17 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		a.cmdErr(s, id, protocol.ErrNotFound, "model_id", "model not on this PC")
 		return
 	}
-	_ = s.Send(&protocol.CmdAck{ID: id})
 	res, err := a.Load(s.Context(), args.ModelID, path, args.Settings)
 	if err != nil {
 		code := protocol.ErrEngineFailed
 		if errors.Is(err, errBusy) {
 			code = protocol.ErrBusy
 		}
-		a.cmdErr(s, id, code, "", "engine did not start")
+		msg := "engine did not start"
+		if errors.Is(err, errNoCUDAUnderLowIL) {
+			msg = EngineNoCUDALowIL + ": the engine cannot use the GPU in its sandbox on this PC; only the host can change that, on the PC"
+		}
+		a.cmdErr(s, id, code, "", msg)
 		return
 	}
 	_ = s.Send(&protocol.CmdDone{ID: id, Result: res})
@@ -793,32 +845,49 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 			return nil, err
 		}
 	}
+	a.mu.Lock()
+	useLowIL, gpuSelect := a.cfg.LowIL && !a.normalIntegrityOK, ""
+	if a.config.GPUSelect != nil {
+		gpuSelect = *a.config.GPUSelect
+	}
+	a.mu.Unlock()
 	sc := supervisor.Config{EngineDir: a.cfg.EngineDir, ModelPath: path, Alias: modelID,
-		Settings: st, LowIL: a.cfg.LowIL, MemLimit: a.cfg.MemLimit, Log: a.log}
+		Settings: st, LowIL: useLowIL, GPUSelect: gpuSelect, MemLimit: a.cfg.MemLimit, Log: a.log}
 	t0 := time.Now()
 	eng, err := a.cfg.Start(lctx, sc)
 	lowIL := sc.LowIL
 	wantGPU := st.GPULayers.All || st.GPULayers.N > 0
+	failure := EngineFailed
 	if sc.LowIL {
 		switch {
+		case errors.Is(err, supervisor.ErrLowILUnavailable):
+			// Windows refused the token before any of the child ran, so no model can have caused this.
+			// This is the one case for a start at normal integrity.
+			a.setLowIL("fallback: Windows refused the low-integrity token")
+			a.log.Warn("the low-integrity token cannot be used on this PC; starting at normal integrity", "err", err.Error())
+			sc.LowIL, lowIL = false, false
+			eng, err = a.cfg.Start(lctx, sc)
 		case err != nil:
-			a.setLowIL("fallback: engine failed under low integrity")
+			// The child ran and failed. A model can do that on purpose, so it is never retried outside the sandbox.
+			a.setLowIL("failed: the engine did not start under low integrity")
 		case wantGPU && a.cfg.GPUInUse != nil:
 			ok, cerr := a.cfg.GPUInUse(lctx, eng.PID())
-			if cerr != nil || !ok {
-				a.setLowIL("fallback: engine started under low integrity but holds no CUDA context")
+			switch {
+			case cerr != nil:
+				// The check itself failed. The engine stays where it is, in the sandbox.
+				a.setLowIL("ok: engine healthy under low integrity (CUDA could not be checked)")
+			case !ok:
+				a.setLowIL("failed: the engine holds no CUDA context under low integrity")
 				eng.Stop()
-				eng, err = nil, errors.New("no CUDA under low IL")
-			} else {
+				eng, err, failure = nil, errNoCUDAUnderLowIL, EngineNoCUDALowIL
+				a.mu.Lock()
+				a.sandboxBlocked = true
+				a.mu.Unlock()
+			default:
 				a.setLowIL("ok: CUDA context present under low integrity")
 			}
 		default:
 			a.setLowIL("ok: engine healthy under low integrity (CUDA not checked)")
-		}
-		if err != nil {
-			a.log.Warn("low-IL start failed; falling back to the normal token", "err", err.Error())
-			sc.LowIL, lowIL = false, false
-			eng, err = a.cfg.Start(lctx, sc)
 		}
 	}
 	ms := time.Since(t0).Milliseconds()
@@ -831,9 +900,9 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 		return nil, errBusy
 	}
 	if err != nil {
-		a.state, a.engineErr, a.settings, a.loadedID = protocol.EngineError, "engine_failed", nil, ""
+		a.state, a.engineErr, a.settings, a.loadedID = protocol.EngineError, failure, nil, ""
 		a.mu.Unlock()
-		a.log.Error("load failed", "err", err.Error(), "ms", ms)
+		a.log.Error("load failed", "code", failure, "err", err.Error(), "ms", ms)
 		a.sendStatus(false)
 		return nil, err
 	}
@@ -852,6 +921,42 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 	go a.watch(eng)
 	a.sendStatus(false)
 	return res, nil
+}
+
+// Engine error codes of status.engine_error.
+const (
+	EngineFailed      = "engine_failed"
+	EngineNoCUDALowIL = "no_cuda_under_low_integrity"
+)
+
+var errNoCUDAUnderLowIL = errors.New("the engine holds no CUDA context under low integrity")
+
+// SandboxBlocked reports that a load failed because CUDA does not work under low integrity on this PC.
+// The tray then offers the host the opt-in.
+func (a *Agent) SandboxBlocked() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sandboxBlocked
+}
+
+// AllowNormalIntegrity records the host's own choice to run the engine outside the low-integrity
+// sandbox on this PC. It is reached only from the tray, after the host clicked; no frame from the hub
+// leads here.
+func (a *Agent) AllowNormalIntegrity(ok bool) {
+	a.mu.Lock()
+	a.normalIntegrityOK = ok
+	if ok {
+		a.sandboxBlocked = false
+	}
+	a.mu.Unlock()
+	a.cfg.OnChange()
+}
+
+// NormalIntegrity reports the host's choice.
+func (a *Agent) NormalIntegrity() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.normalIntegrityOK
 }
 
 func (a *Agent) setLowIL(s string) {

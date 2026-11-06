@@ -72,6 +72,10 @@ func (f *fetcher) get(ctx context.Context, rel string, hdr http.Header) (*http.R
 	if err != nil || !strings.HasPrefix(u.Path, f.base.Path) {
 		return nil, errors.New("bad release path")
 	}
+	return f.follow(ctx, u, hdr)
+}
+
+func (f *fetcher) follow(ctx context.Context, u *url.URL, hdr http.Header) (*http.Response, error) {
 	for hop := 0; ; hop++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
@@ -112,6 +116,27 @@ func (f *fetcher) small(ctx context.Context, rel string, max int64) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
+	return readSmall(resp, max)
+}
+
+// latestFile fetches a file of the release GitHub calls latest. The URL is the fixed prefix's sibling
+// .../releases/latest/download/<name>; GitHub redirects it to the release's own download path and
+// never to a prerelease. What comes back is trusted only after its signature is verified.
+func (f *fetcher) latestFile(ctx context.Context, name string, max int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	u, err := f.base.Parse("../latest/download/" + name)
+	if err != nil {
+		return nil, errors.New("bad release path")
+	}
+	resp, err := f.follow(ctx, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	return readSmall(resp, max)
+}
+
+func readSmall(resp *http.Response, max int64) ([]byte, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))

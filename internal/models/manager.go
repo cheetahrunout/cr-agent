@@ -145,7 +145,8 @@ type Manager struct {
 	wake    chan struct{} // closed and replaced when paused changes
 	slot    chan struct{} // one download at a time
 	inspect sync.Mutex
-	recent  []time.Time // inspect starts in the last minute
+	recent  []time.Time     // inspect starts in the last minute
+	hashed  map[string]bool // files whose SHA-256 this process has checked, by path and hash
 }
 
 var (
@@ -195,7 +196,7 @@ func New(o Options) (*Manager, error) {
 	if o.OnChange == nil {
 		o.OnChange = func(bool) {}
 	}
-	m := &Manager{o: o, log: o.Log, jobs: map[string]*job{}, wake: make(chan struct{}), slot: make(chan struct{}, 1)}
+	m := &Manager{o: o, log: o.Log, hashed: map[string]bool{}, jobs: map[string]*job{}, wake: make(chan struct{}), slot: make(chan struct{}, 1)}
 	if err := m.open(o.Dir); err != nil {
 		return nil, err
 	}
@@ -361,7 +362,7 @@ func (m *Manager) Download(a *protocol.DownloadArgs, onDone func(Outcome)) {
 			onDone(Outcome{Err: &Error{Code: protocol.ErrBadArgs, Field: "model_id", Message: "this model id belongs to another repo"}})
 			return
 		}
-		if sameRequest(e, a) && e.State == StateReady {
+		if sameRequest(e, a) && e.State == StateReady && m.trusted(e) {
 			res := resultOf(e)
 			m.mu.Unlock()
 			onDone(Outcome{Result: res})
@@ -516,8 +517,10 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 	e := m.index[modelID]
 	dir := m.dir
 	var path, state, kind string
+	var files []protocol.LocalFile
 	if e != nil && len(e.Files) > 0 {
 		path, state, kind = e.path(dir, e.Files[0].Path), e.State, e.Kind
+		files = append(files, e.Files...)
 	}
 	m.mu.Unlock()
 	switch {
@@ -528,8 +531,15 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 	case kind != "gguf":
 		return nil, errf(protocol.ErrUnsupported, "a projector cannot be loaded on its own")
 	}
+	if !m.trusted(e) {
+		m.log.Warn("load refused: neither an allowlisted publisher nor a stored approval", "model_id", modelID)
+		return nil, errf(protocol.ErrDenied, "this PC's host did not allow this model; download it again to be asked")
+	}
 	if err := noReparse(dir, filepath.Dir(path)); err != nil {
 		return nil, errf(protocol.ErrEngineFailed, "%v", err)
+	}
+	if herr := m.checkHashes(e, dir, files); herr != nil {
+		return nil, herr
 	}
 	h, err := checkFile(path)
 	if err != nil {
@@ -541,6 +551,39 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 		return nil, errf(protocol.ErrEngineFailed, "the model file cannot be read")
 	}
 	return &Loadable{Path: path, Size: st.Size(), Header: h}, nil
+}
+
+// checkHashes hashes a model's files on their first load in this process (finding M3). The index says
+// what the hash must be; the file on disk may have changed since it was downloaded.
+func (m *Manager) checkHashes(e *Entry, dir string, files []protocol.LocalFile) *Error {
+	for _, f := range files {
+		path := e.path(dir, f.Path)
+		key := path + "|" + f.SHA256
+		m.mu.Lock()
+		done := m.hashed[key]
+		m.mu.Unlock()
+		if done {
+			continue
+		}
+		t0 := time.Now()
+		sum, err := hashFile(context.Background(), path)
+		if err != nil || sum != f.SHA256 {
+			m.mu.Lock()
+			if m.index[e.ModelID] == e {
+				e.State = StateError
+				m.saveLocked()
+			}
+			m.mu.Unlock()
+			m.log.Error("load refused: a model file changed since it was downloaded", "model_id", e.ModelID)
+			m.o.OnChange(true)
+			return errf(protocol.ErrHashMismatch, "a model file does not match its SHA-256; download it again")
+		}
+		m.log.Info("model file hashed before its first load", "model_id", e.ModelID, "ms", time.Since(t0).Milliseconds())
+		m.mu.Lock()
+		m.hashed[key] = true
+		m.mu.Unlock()
+	}
+	return nil
 }
 
 // checkFile is the GGUF pre-check: magic, version, caps, and every tensor inside the file.

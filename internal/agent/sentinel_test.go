@@ -95,8 +95,9 @@ func TestSentinelNotInAgentLog(t *testing.T) {
 	if f["t"] != "cmd.done" {
 		t.Fatalf("load: %v", f)
 	}
-	if requireGPU && f["result"].(map[string]any)["cuda_context"] != true {
-		t.Fatalf("the engine holds no CUDA context: %v", f["result"])
+	t.Logf("load: %v", f["result"])
+	if requireGPU && (f["result"].(map[string]any)["cuda_context"] != true || f["result"].(map[string]any)["low_il"] != true) {
+		t.Fatalf("the engine is not on the GPU in its sandbox: %v", f["result"])
 	}
 
 	id := 10

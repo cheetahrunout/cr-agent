@@ -124,7 +124,7 @@ func (m *Manager) work(j *job, e *Entry) Outcome {
 	// 2. Was it the host's choice? (§9.2, rulings B13, B14)
 	owner, _, _ := strings.Cut(e.Repo, "/")
 	prompt := Prompt{ModelID: e.ModelID, Repo: e.Repo, Commit: e.Commit, Files: e.Names, SizeBytes: total}
-	if Allowlisted(owner) || m.approved(e.Repo, e.Commit) {
+	if Allowlisted(owner) || m.approved(e.Repo, e.Commit, e.Names) {
 		if m.o.Started != nil {
 			m.o.Started(prompt)
 		}
@@ -146,7 +146,7 @@ func (m *Manager) work(j *job, e *Entry) Outcome {
 		if !ok {
 			return Outcome{Err: errf(protocol.ErrDenied, "the host did not allow this download on the PC")}
 		}
-		if err := m.remember(e.Repo, e.Commit); err != nil {
+		if err := m.remember(e.Repo, e.Commit, e.Names); err != nil {
 			m.log.Warn("approval not remembered", "err", err.Error())
 		}
 		m.mu.Lock()
@@ -475,7 +475,9 @@ func (m *Manager) fetchFile(ctx context.Context, j *job, e *Entry, root string, 
 	return nil
 }
 
-// approvals is the DPAPI-protected list of (repo, commit) pairs the host allowed (ruling B13).
+// approvals is the DPAPI-protected list of files the host allowed: one row per (repo, commit, file),
+// exactly what the dialog showed (finding M2). Allowing a file of a commit says nothing about the
+// repo's other files.
 type approvals struct {
 	Allowed []approval `json:"allowed"`
 }
@@ -483,6 +485,7 @@ type approvals struct {
 type approval struct {
 	Repo   string `json:"repo"`
 	Commit string `json:"commit"`
+	File   string `json:"file"`
 }
 
 func (m *Manager) loadApprovals() approvals {
@@ -501,13 +504,32 @@ func (m *Manager) loadApprovals() approvals {
 	return a
 }
 
-func (m *Manager) approved(repo, commit string) bool {
-	for _, x := range m.loadApprovals().Allowed {
-		if x.Repo == repo && x.Commit == commit {
-			return true
+// approved reports whether the host allowed every one of these files of this commit.
+func (m *Manager) approved(repo, commit string, files []string) bool {
+	if len(files) == 0 {
+		return false
+	}
+	allowed := m.loadApprovals().Allowed
+	for _, f := range files {
+		found := false
+		for _, x := range allowed {
+			if x.Repo == repo && x.Commit == commit && x.File == f {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// trusted is the rule for a model to be used at all: its publisher is on the shipped allowlist, or
+// the host allowed exactly these files (finding M3). An entry that only the index names is neither.
+func (m *Manager) trusted(e *Entry) bool {
+	owner, _, _ := strings.Cut(e.Repo, "/")
+	return Allowlisted(owner) || m.approved(e.Repo, e.Commit, e.Names)
 }
 
 func (m *Manager) repoAllowedBefore(repo string) bool {
@@ -519,12 +541,14 @@ func (m *Manager) repoAllowedBefore(repo string) bool {
 	return false
 }
 
-func (m *Manager) remember(repo, commit string) error {
+func (m *Manager) remember(repo, commit string, files []string) error {
 	if m.o.Store == nil {
 		return errors.New("no store")
 	}
 	a := m.loadApprovals()
-	a.Allowed = append(a.Allowed, approval{Repo: repo, Commit: commit})
+	for _, f := range files {
+		a.Allowed = append(a.Allowed, approval{Repo: repo, Commit: commit, File: f})
+	}
 	b, err := json.Marshal(a)
 	if err != nil {
 		return err

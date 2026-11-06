@@ -1,9 +1,11 @@
 package link
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
@@ -224,5 +227,62 @@ func TestUnknownTypeDroppedAndBadCmdAnswered(t *testing.T) {
 	m := <-done
 	if m["t"] != "cmd.err" || m["code"] != "bad_args" || m["id"] != "c-01JCKZ3Q9X8YB7N6M5P4R3S2T4" {
 		t.Fatalf("answer %v", m)
+	}
+}
+
+// Finding L1: the upgrade carries the machine key, and it goes to the validated host or nowhere.
+func TestUpgradeDoesNotFollowRedirects(t *testing.T) {
+	var reached atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Add(1)
+		if c, err := websocket.Accept(w, r, nil); err == nil {
+			c.Close(websocket.StatusNormalClosure, "")
+		}
+	}))
+	defer other.Close()
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/agent", http.StatusFound)
+	}))
+	defer hub.Close()
+	h := &nopHandler{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slept := make(chan struct{}, 1)
+	c := New(Config{URL: wsURL(hub), Key: "crm_x_y", Handler: h, Sleep: func(context.Context, time.Duration) error {
+		cancel()
+		slept <- struct{}{}
+		return context.Canceled
+	}})
+	c.Run(ctx)
+	<-slept
+	if reached.Load() != 0 {
+		t.Fatal("the upgrade followed a redirect to another host")
+	}
+}
+
+// Finding L4: what the hub sends is shortened before it reaches the log.
+func TestHubStringsAreClippedInTheLog(t *testing.T) {
+	long := strings.Repeat("Z", 5000)
+	srv := hubServer(t, func(ctx context.Context, c *websocket.Conn) {
+		readT(ctx, c)
+		c.Write(ctx, websocket.MessageText, []byte(`{"v":1,"t":"`+long+`"}`))
+		c.Write(ctx, websocket.MessageText, []byte(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T4","op":"`+long+`","args":{}}`))
+		c.Write(ctx, websocket.MessageText, []byte(`{"v":1,"t":"welcome","proto":"`+long+`","mode":"normal","ping_interval_s":25,"limits":{}}`))
+		c.Close(websocket.StatusNormalClosure, "")
+	})
+	var buf bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cl := New(Config{URL: wsURL(srv), Key: "crm_x_y", Handler: &nopHandler{}, Log: slog.New(slog.NewTextHandler(&buf, nil)),
+		Sleep: func(context.Context, time.Duration) error { cancel(); return context.Canceled }})
+	cl.Run(ctx)
+	if strings.Contains(buf.String(), strings.Repeat("Z", 200)) {
+		t.Fatalf("a hub string reached the log whole: %d bytes of log", buf.Len())
+	}
+	if !strings.Contains(buf.String(), "unknown frame type dropped") {
+		t.Fatalf("log: %s", buf.String())
+	}
+	if got := Clip(strings.Repeat("é", 200)); !strings.HasSuffix(got, "…") || !utf8.ValidString(got) || len(got) > 130 {
+		t.Fatalf("clip %q", got)
 	}
 }

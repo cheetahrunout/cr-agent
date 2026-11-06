@@ -284,3 +284,23 @@ func TestCrashesAndRefusals(t *testing.T) {
 		t.Fatalf("no pointer: exit %d", code)
 	}
 }
+
+// Finding L8. The launcher agrees with the updater on what a crash can leave of the manifest pair.
+func TestVerifyManifestPairStates(t *testing.T) {
+	w := newWorld(t)
+	w.install("0.1.0", true)
+	if err := Verify(w.root, "0.1.0", w.r.Keys); err != nil {
+		t.Fatal(err)
+	}
+	m := layout.ManifestFile(w.root, "0.1.0")
+	raw, _ := os.ReadFile(m)
+	os.Remove(m)
+	if err := Verify(w.root, "0.1.0", w.r.Keys); err != nil {
+		t.Fatalf("a signature without a manifest is what a crash leaves: %v", err)
+	}
+	os.WriteFile(m, raw, 0o644)
+	os.Remove(m + ".minisig")
+	if err := Verify(w.root, "0.1.0", w.r.Keys); err == nil {
+		t.Fatal("a manifest without a signature was accepted")
+	}
+}

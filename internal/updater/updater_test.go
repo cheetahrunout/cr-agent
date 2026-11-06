@@ -475,3 +475,243 @@ func TestRollbackIsNoticed(t *testing.T) {
 		t.Fatalf("second attempt at the reverted version: %v", err)
 	}
 }
+
+// Finding M4. A fresh install whose manifest could not be checked yet has committed_seq 0, and a hub
+// must not be able to send it back to an older signed release.
+func TestUnverifiedInstallIsNotDowngraded(t *testing.T) {
+	w := &world{t: t, srv: relsrv.New(t.TempDir()), root: filepath.Join(t.TempDir(), "cr-agent"), key: sign.ThrowawayKey()}
+	t.Cleanup(w.srv.Close)
+	var err error
+	if w.st, err = store.OpenWith(w.root, plain{}); err != nil {
+		t.Fatal(err)
+	}
+	w.publish(spec("0.1.0", 1))
+	w.publish(spec("0.3.0", 9))
+	cur := spec("0.2.0", 5)
+	for rel, b := range map[string][]byte{"versions/0.2.0/cragent.exe": cur.Agent, "versions/0.2.0/launcher.exe": cur.Launcher, "launcher.exe": cur.Launcher} {
+		p := filepath.Join(w.root, filepath.FromSlash(rel))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, b, 0o755)
+	}
+	layout.WritePointer(w.root, layout.Pointer{Version: "0.2.0"})
+	u := w.updater("0.2.0")
+	if err := u.Startup(); err != nil || !u.Unverified() {
+		t.Fatalf("startup %v, unverified %v", err, u.Unverified())
+	}
+	refused(t, u.Update(context.Background(), "0.1.0", nil), "older than the running")
+	if p, _ := layout.ReadPointer(w.root); p.Version != "0.2.0" {
+		t.Fatalf("pointer %+v", p)
+	}
+	// A newer release is still allowed: it is verified in full, and it is the way out of this state.
+	if err := u.Update(context.Background(), "0.3.0", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Finding M4. The version on trial is not committed yet, but it is the floor already.
+func TestRunningVersionOnTrialIsTheFloor(t *testing.T) {
+	w := newWorld(t) // committed 0.1.0, seq 1
+	w.publish(spec("0.1.1", 5))
+	w.publish(spec("0.1.2", 3)) // signed, newer than the committed one, older than the running one
+	if err := w.updater("0.1.0").Update(context.Background(), "0.1.1", nil); err != nil {
+		t.Fatal(err)
+	}
+	u := w.updater("0.1.1")
+	if err := u.Startup(); err != nil {
+		t.Fatal(err)
+	}
+	if seq, _ := u.Committed(); seq != 1 {
+		t.Fatalf("committed %d before the health gate", seq)
+	}
+	refused(t, u.Update(context.Background(), "0.1.2", nil), "older than the installed 5")
+}
+
+// Finding M4. A commit that lands during the download must survive the update's write.
+func TestCommitDuringUpdateIsKept(t *testing.T) {
+	w := newWorld(t)
+	w.publish(spec("0.1.1", 2))
+	w.publish(spec("0.1.2", 3))
+	if err := w.updater("0.1.0").Update(context.Background(), "0.1.1", nil); err != nil {
+		t.Fatal(err)
+	}
+	u := w.updater("0.1.1")
+	if err := u.Startup(); err != nil {
+		t.Fatal(err)
+	}
+	marked := false
+	err := u.Update(context.Background(), "0.1.2", func(state string, _ float64) {
+		if state == "downloading" && !marked {
+			marked = true
+			if err := u.MarkHealthy(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	if err != nil || !marked {
+		t.Fatalf("update %v, marked %v", err, marked)
+	}
+	if seq, v := u.Committed(); seq != 2 || v != "0.1.1" {
+		t.Fatalf("committed %d %s after the update: the commit was lost", seq, v)
+	}
+}
+
+// Finding M4. An unreadable state is an error, never a fresh install.
+func TestUnreadableStateIsAnError(t *testing.T) {
+	w := newWorld(t)
+	w.publish(spec("0.1.1", 2))
+	path := filepath.Join(w.st.Dir(), "state", secretRelease+".bin")
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string][]byte{"damaged json": []byte("P:{not json"), "too short for the protector": []byte("P:")} {
+		os.WriteFile(path, content, 0o600)
+		u := w.updater("0.1.0")
+		if err := u.Startup(); !errors.Is(err, ErrStateUnreadable) {
+			t.Errorf("%s: startup %v", name, err)
+		}
+		refused(t, u.Update(context.Background(), "0.1.1", nil), "cannot be read")
+	}
+	os.WriteFile(path, orig, 0o600)
+	if err := w.updater("0.1.0").Startup(); err != nil {
+		t.Fatal(err)
+	}
+	// No state at all is a fresh install.
+	os.Remove(path)
+	if err := w.updater("0.1.0").Startup(); err != nil {
+		t.Fatalf("no state: %v", err)
+	}
+}
+
+// Finding L8. Whatever a crash leaves of the manifest pair, the next start is sane.
+func TestManifestPairAfterACrash(t *testing.T) {
+	w := newWorld(t)
+	path := layout.ManifestFile(w.root, "0.1.0")
+	raw, _ := os.ReadFile(path)
+	sig, _ := os.ReadFile(path + ".minisig")
+	if len(raw) == 0 || len(sig) == 0 {
+		t.Fatal("no pair was written")
+	}
+	// The crash between the two writes: a signature, no manifest. Without the committed state this is "not checked yet".
+	os.Remove(path)
+	st := filepath.Join(w.st.Dir(), "state", secretRelease+".bin")
+	os.Remove(st)
+	u := w.updater("0.1.0")
+	if err := u.Startup(); err != nil || !u.Unverified() {
+		t.Fatalf("signature only: %v, unverified %v", err, u.Unverified())
+	}
+	if err := u.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, raw) {
+		t.Fatal("the pair was not written again")
+	}
+	// A manifest without a signature is not what a crash leaves, and it is refused.
+	os.Remove(st)
+	os.Remove(path + ".minisig")
+	if err := w.updater("0.1.0").Startup(); err == nil {
+		t.Fatal("a manifest without a signature was accepted")
+	}
+}
+
+// Finding M1: the daily check finds a release the hub never mentioned, verified like any update.
+func TestDailyCheckOfTheLatestRelease(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	u := w.updater("0.1.0")
+	if err := u.Startup(); err != nil {
+		t.Fatal(err)
+	}
+	// No latest release yet.
+	if _, err := u.CheckLatest(ctx); err == nil || u.UpdateAvailable() != "" || u.LatestVerified() != "" {
+		t.Fatalf("no release: %v, available %q", err, u.UpdateAvailable())
+	}
+	// The latest is the running version: nothing to offer, but it is verified and reported.
+	w.srv.Latest = "0.1.0"
+	if v, err := u.CheckLatest(ctx); err != nil || v != "0.1.0" || u.UpdateAvailable() != "" || u.LatestVerified() != "0.1.0" {
+		t.Fatalf("same version: %q %v, available %q", v, err, u.UpdateAvailable())
+	}
+	// A newer one.
+	w.publish(spec("0.1.1", 2))
+	w.srv.Latest = "0.1.1"
+	if v, err := u.CheckLatest(ctx); err != nil || v != "0.1.1" || u.UpdateAvailable() != "0.1.1" {
+		t.Fatalf("newer: %q %v, available %q", v, err, u.UpdateAvailable())
+	}
+	// It survives a restart, and it installs.
+	u2 := w.updater("0.1.0")
+	if err := u2.Startup(); err != nil || u2.UpdateAvailable() != "0.1.1" {
+		t.Fatalf("after a restart: %v, %q", err, u2.UpdateAvailable())
+	}
+	if err := u2.Update(ctx, u2.UpdateAvailable(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := layout.ReadPointer(w.root); p.Version != "0.1.1" {
+		t.Fatalf("pointer %+v", p)
+	}
+	// The new version has nothing to offer.
+	u3 := w.updater("0.1.1")
+	if err := u3.Startup(); err != nil || u3.UpdateAvailable() != "" {
+		t.Fatalf("on the new version: %v, %q", err, u3.UpdateAvailable())
+	}
+}
+
+func TestDailyCheckRefuses(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	u := w.updater("0.1.0")
+	if err := u.Startup(); err != nil {
+		t.Fatal(err)
+	}
+	// One flipped byte in the manifest.
+	w.publish(spec("0.1.1", 2))
+	w.srv.Latest = "0.1.1"
+	path := filepath.Join(w.srv.Dir, "v0.1.1", "manifest.json")
+	raw, _ := os.ReadFile(path)
+	bad := append([]byte(nil), raw...)
+	bad[len(bad)/2] ^= 1
+	os.WriteFile(path, bad, 0o644)
+	if _, err := u.CheckLatest(ctx); err == nil || u.UpdateAvailable() != "" {
+		t.Fatalf("flipped byte: %v, %q", err, u.UpdateAvailable())
+	}
+	os.WriteFile(path, raw, 0o644)
+	// Another key.
+	other, _ := sign.KeyFromSeed(bytes.Repeat([]byte{5}, 32))
+	if _, err := reltest.MakeDist(filepath.Join(w.srv.Dir, "v0.1.2"), spec("0.1.2", 3), other); err != nil {
+		t.Fatal(err)
+	}
+	w.srv.Latest = "0.1.2"
+	if _, err := u.CheckLatest(ctx); !errors.Is(err, release.ErrUntrustedKey) || u.UpdateAvailable() != "" {
+		t.Fatalf("other key: %v, %q", err, u.UpdateAvailable())
+	}
+	// The rollback test's release, marked latest by mistake, is never offered.
+	s := spec("0.1.3", 4)
+	m, err := reltest.MakeDist(filepath.Join(w.srv.Dir, "v0.1.3"), s, w.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Notes = "ROLLBACK TEST: this agent never passes the health gate."
+	if err := reltest.Sign(filepath.Join(w.srv.Dir, "v0.1.3"), m, w.key); err != nil {
+		t.Fatal(err)
+	}
+	w.srv.Latest = "0.1.3"
+	if _, err := u.CheckLatest(ctx); err == nil || u.UpdateAvailable() != "" {
+		t.Fatalf("rollback test as latest: %v, %q", err, u.UpdateAvailable())
+	}
+	// A release older than the running one is verified but not offered, and "latest" going back keeps the newer one.
+	w.publish(spec("0.1.1", 2))
+	w.srv.Latest = "0.1.1"
+	if v, err := u.CheckLatest(ctx); err != nil || v != "0.1.1" {
+		t.Fatal(err)
+	}
+	w.srv.Latest = "0.1.0"
+	if v, err := u.CheckLatest(ctx); err != nil || v != "0.1.1" || u.UpdateAvailable() != "0.1.1" {
+		t.Fatalf("latest went back: %q %v, %q", v, err, u.UpdateAvailable())
+	}
+	// Redirects out of GitHub are refused, as for any release file.
+	w2 := newWorld(t)
+	w2.srv.RedirectLatestTo = "https://evil.example/manifest.json"
+	u4 := w2.updater("0.1.0")
+	if _, err := u4.CheckLatest(ctx); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("redirect: %v", err)
+	}
+}

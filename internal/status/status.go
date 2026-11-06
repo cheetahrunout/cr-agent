@@ -65,9 +65,9 @@ func Line(in Input) (string, Icon) {
 	case in.Inflight > 0:
 		text, icon = "Connected · sharing · in use", IconAmber
 	case in.Engine == protocol.EngineLoading:
-		text, icon = "Connected · loading "+in.ModelID, IconAmber
+		text, icon = "Connected · loading a model", IconAmber
 	case in.Engine == protocol.EngineLoaded:
-		text = "Connected · sharing · " + in.ModelID + " loaded"
+		text = "Connected · sharing · model loaded"
 	}
 	if in.Downloading {
 		text += fmt.Sprintf(" · downloading %.0f %%", in.DownloadPct)

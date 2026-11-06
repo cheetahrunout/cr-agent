@@ -1,5 +1,5 @@
 # Builds the agent, the launcher, the two release zips and the installer for one version.
-# The release workflow runs this; so can a developer, locally.
+# scripts\build-release.ps1 runs this for a real release; a developer can too.
 #
 #   pwsh scripts\build-installer.ps1 -Version 0.1.0 -EngineDir <folder with llama-server.exe and its DLLs>
 #
@@ -25,7 +25,8 @@ param(
     [switch]$DebugBuild,
     [switch]$Scratch,
     [switch]$NoInstaller,
-    [switch]$RollbackTest
+    [switch]$RollbackTest,
+    [string]$Notes = ""
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -91,7 +92,8 @@ if (-not $NoInstaller) {
 # 5. The unsigned manifest: every archive and every installed file with size and SHA-256.
 if (-not $Scratch) {
     $manifestArgs = @("manifest", "-dist", $dist, "-version", $Version)
-    if ($RollbackTest) { $manifestArgs += @("-notes", "ROLLBACK TEST: this agent never passes the health gate. Never offer it to friends.") }
+    if ($RollbackTest) { $Notes = ("ROLLBACK TEST: this agent never passes the health gate. Never offer it to friends. " + $Notes).Trim() }
+    if ($Notes) { $manifestArgs += @("-notes", $Notes) }
     Run "$tools\signtool.exe" $manifestArgs
 }
 ""

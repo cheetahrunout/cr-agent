@@ -1,9 +1,11 @@
-# The GPU smoke test of a downloaded release, on the NVIDIA PC, before it is signed (PLAN §13). Also
-# run this at every llama.cpp bump: it includes the sentinel test of ruling B16.
+# The GPU smoke test of a locally built release (ruling B62). The lead runs it; never in the session
+# where the passphrase is typed. Also run it at every llama.cpp bump: it includes the sentinel test
+# of ruling B16.
 #
-#   pwsh -File scripts\smoke-gpu.ps1 -Dist <folder with the release's files>
+#   pwsh -File scripts\smoke-gpu.ps1 -Dist <release folder>
 #
-# It unpacks the release's engine archive into a temporary folder and checks that
+# It runs only built files. Before anything runs, every file of the release's engine archive is
+# compared with the official zips, fetched afresh and checked against engine.lock. Then it checks that
 #   - it is the build engine.lock pins, and it knows every flag and chat template name the agent can emit;
 #   - it loads a small model on the GPU under low integrity, streams and cancels;
 #   - a prompt with a sentinel in it leaves no trace in the agent's log, also when the engine fails on it.
@@ -21,9 +23,16 @@ if (-not $zip) { throw "no engine-*.zip in $Dist" }
 $tag = (Get-Content (Join-Path $repo "engine.lock") -Raw | ConvertFrom-Json).llama_tag
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("cr-agent-smoke-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 try {
+    & (Join-Path $PSScriptRoot "fetch-engine.ps1") -Out (Join-Path $tmp "official")
     "unpacking $($zip.Name) ..."
     Expand-Archive -Path $zip.FullName -DestinationPath $tmp
-    $env:CRAGENT_ENGINE_DIR = Join-Path $tmp "engine\$tag"
+    $built = Join-Path $tmp "engine\$tag"
+    $official = Join-Path $tmp "official"
+    $a = @(Get-ChildItem $built -File -Recurse | ForEach-Object { $_.FullName.Substring($built.Length + 1) + " " + (Get-FileHash $_.FullName -Algorithm SHA256).Hash } | Sort-Object)
+    $b = @(Get-ChildItem $official -File -Recurse | ForEach-Object { $_.FullName.Substring($official.Length + 1) + " " + (Get-FileHash $_.FullName -Algorithm SHA256).Hash } | Sort-Object)
+    if ($a.Count -eq 0 -or (Compare-Object $a $b)) { throw "the engine in $($zip.Name) is not the one engine.lock pins. Nothing was run." }
+    "engine archive matches the official zips: $($a.Count) files"
+    $env:CRAGENT_ENGINE_DIR = $built
     $env:CRAGENT_TEST_GGUF = $Model
     $env:CRAGENT_REQUIRE_GPU = "1"
     & go test -count=1 -run 'TestPinnedEngine' ./internal/supervisor

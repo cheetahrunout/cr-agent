@@ -68,14 +68,18 @@ func ApprovalText(p models.Prompt) string {
 		b.WriteString("Download a model from a publisher that is not on the built-in list?\n\n")
 	}
 	b.WriteString(p.Repo + "\n")
-	files := p.Files
-	if len(files) > 3 {
-		files = append(append([]string{}, files[:3]...), fmt.Sprintf("and %d more files", len(p.Files)-3))
-	}
-	b.WriteString(strings.Join(files, "\n"))
-	b.WriteString(" · " + HumanSize(p.SizeBytes) + "\n\n")
+	// Every file is listed: Allow covers exactly these (finding M2).
+	b.WriteString(strings.Join(p.Files, "\n"))
+	b.WriteString("\n" + HumanSize(p.SizeBytes) + " · commit " + shortCommit(p.Commit) + "\n\n")
 	b.WriteString("Allow it only if you asked for this in the hub.")
 	return b.String()
+}
+
+func shortCommit(c string) string {
+	if len(c) > 12 {
+		return c[:12]
+	}
+	return c
 }
 
 // ApprovalLabel is the short form for the tray menu and the notification.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -81,16 +82,70 @@ func TestSingleInstance(t *testing.T) {
 func TestLogRotation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.log")
 	os.WriteFile(path, make([]byte, 11<<20), 0o600)
-	f := openLog(path)
-	if f == nil {
-		t.Fatal("log not opened")
-	}
-	logWriter{f}.Write([]byte("line\n"))
-	f.Close()
+	w := newLogWriter(path)
+	w.Write([]byte("line\n"))
 	if st, _ := os.Stat(path); st.Size() != 5 {
 		t.Fatalf("new log has %d bytes", st.Size())
 	}
 	if st, err := os.Stat(path + ".1"); err != nil || st.Size() != 11<<20 {
 		t.Fatalf("old log not kept: %v", err)
+	}
+	w.Close()
+}
+
+// Finding L4: the log rotates while the agent runs, not only at its start.
+func TestLogRotatesInTheWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	w := newLogWriter(path)
+	defer w.Close()
+	line := bytes.Repeat([]byte("x"), 1<<20)
+	for i := 0; i < 25; i++ {
+		if _, err := w.Write(line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err1 := os.Stat(path)
+	b, err2 := os.Stat(path + ".1")
+	if err1 != nil || err2 != nil || a.Size() > maxLogSize || b.Size() > maxLogSize || a.Size()+b.Size() > 2*maxLogSize {
+		t.Fatalf("log %v (%v), old log %v (%v)", a, err1, b, err2)
+	}
+}
+
+// Finding L7: every flag that points the agent at another engine, key or model, or weakens the
+// sandbox, is named, and a release build refuses to start with any of them.
+func TestDebugOnlyFlags(t *testing.T) {
+	clean := options{approve: "ask", lowIL: true}
+	if set := debugOnlyFlags(clean); len(set) != 0 {
+		t.Fatalf("a plain start names %v", set)
+	}
+	for name, o := range map[string]options{
+		"--engine":       {approve: "ask", lowIL: true, engine: "x"},
+		"--key":          {approve: "ask", lowIL: true, key: "x"},
+		"--model":        {approve: "ask", lowIL: true, model: "x"},
+		"--model-id":     {approve: "ask", lowIL: true, modelID: "x"},
+		"--load":         {approve: "ask", lowIL: true, load: true},
+		"--low-il=false": {approve: "ask"},
+		"--no-mem-cap":   {approve: "ask", lowIL: true, noMemCap: true},
+		"--hf-base":      {approve: "ask", lowIL: true, hfBase: "x"},
+		"--release-base": {approve: "ask", lowIL: true, releaseBase: "x"},
+		"--approve":      {approve: "allow", lowIL: true},
+	} {
+		if set := debugOnlyFlags(o); len(set) != 1 || set[0] != name {
+			t.Errorf("%s: %v", name, set)
+		}
+	}
+	t.Setenv("CRAGENT_ENGINE", `C:\evil`)
+	t.Setenv("CRAGENT_KEY", "crm_x_y")
+	if got := devEnv("CRAGENT_ENGINE"); debugBuild != (got != "") {
+		t.Fatalf("devEnv %q in a build with debugBuild=%v", got, debugBuild)
+	}
+}
+
+func TestLatestDelay(t *testing.T) {
+	if d := latestDelay(0); d != 24*time.Hour {
+		t.Fatal(d)
+	}
+	if d := latestDelay(int64(30 * time.Minute)); d != 24*time.Hour+30*time.Minute {
+		t.Fatal(d)
 	}
 }

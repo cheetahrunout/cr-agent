@@ -13,11 +13,12 @@ type proc struct {
 }
 
 type spawnOptions struct {
-	Exe      string
-	Args     []string
-	Dir      string
-	LowIL    bool
-	MemLimit uint64
+	Exe       string
+	Args      []string
+	Dir       string
+	LowIL     bool
+	MemLimit  uint64
+	GPUSelect string
 }
 
 func spawn(spawnOptions) (*proc, error) { return nil, errors.New("engine supervisor: Windows only") }

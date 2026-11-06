@@ -53,3 +53,35 @@ func TestAllowDownloadDeadline(t *testing.T) {
 		t.Fatalf("dialog lasted %v", el)
 	}
 }
+
+func TestAddFilesTexts(t *testing.T) {
+	long := "Qwen3.6-Very-Long-Model-Name-With-Many-Words-Q4_K_XL.gguf"
+	scan := models.Scan{Dir: `C:\\models`,
+		Found:   []models.Found{{Key: long, Files: []string{long}, Size: 18 << 30}, {Key: "big-00001-of-00002.gguf", Files: []string{"big-00001-of-00002.gguf", "big-00002-of-00002.gguf"}, Size: 2 << 30}},
+		Refused: []models.Refused{{Name: "evil\u202egnp.gguf\nsecond line", Why: "its name has characters the hub cannot carry"}}}
+	row := FoundRow(scan.Found[0])
+	if !strings.HasPrefix(row, "18.0 GB · ") || !strings.HasSuffix(row, "Q4_K_XL.gguf") || len([]rune(row)) > 40 {
+		t.Fatalf("row %q", row)
+	}
+	if row := FoundRow(scan.Found[1]); row != "2.0 GB · big (2 parts)" {
+		t.Fatalf("row %q", row)
+	}
+	text := RefusedText(scan)
+	if strings.ContainsRune(text, 0x202e) || strings.Contains(text, "\nsecond line") {
+		t.Fatalf("a file name steered the text: %q", text)
+	}
+	conf := ConfirmAddText(scan, []string{long})
+	if !strings.Contains(conf, long) || !strings.Contains(conf, "18.0 GB") || strings.Contains(conf, "big-") {
+		t.Fatalf("confirm %q", conf)
+	}
+	// Two names that shorten to one row stay two rows.
+	a, b := "Same-Start-Of-A-Long-Name-Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-Q4.gguf", "Same-Start-Of-A-Long-Name-Bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-Q4.gguf"
+	rows, key := listRows(models.Scan{Found: []models.Found{{Key: a, Files: []string{a}, Size: 1}, {Key: b, Files: []string{b}, Size: 1}}})
+	if len(rows) != 2 || len(key) != 2 || key[rows[0]] != a || key[rows[1]] != b {
+		t.Fatalf("rows %q", rows)
+	}
+	res := ImportResultText([]models.ImportResult{{Key: "a.gguf", ModelID: "a"}, {Key: "b.gguf", Err: "cancelled"}})
+	if !strings.Contains(res, "a.gguf") || !strings.Contains(res, "b.gguf: cancelled") {
+		t.Fatalf("result %q", res)
+	}
+}

@@ -1,0 +1,6 @@
+{ "v": 1, "t": "status", "engine": "unloaded", "jobs": [], "local_pause": false,
+  "models": [
+    { "model_id": "smollm2-360m-q8_0", "repo": "local-file/smollm2-360m-q8_0", "commit": "0123456789abcdef0123456789abcdef01234567",
+      "files": [ { "path": "smollm2-360m-q8_0.gguf", "size": 386404992, "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" } ],
+      "kind": "gguf", "state": "ready", "size_bytes": 386404992 }
+  ] }

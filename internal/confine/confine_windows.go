@@ -85,3 +85,13 @@ func UnderRoot(f *os.File, root string) error {
 	}
 	return nil
 }
+
+// Links is how many names an open file has. A file with more than one is also reachable, and
+// changeable, by a name that may lie outside the folder.
+func Links(f *os.File) (uint32, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		return 0, err
+	}
+	return info.NumberOfLinks, nil
+}

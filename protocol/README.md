@@ -58,6 +58,7 @@ socket, 4003 machine revoked (stop reconnecting).
 - While a download moves bytes the agent sends one `status` frame a second with the job's `pct`, `bytes_done` and `bytes_total`,
   and one more at once on every state change (a job starts, waits for a click, pauses, ends; the engine changes state).
 - `models[]` is in a `status` frame only when a model's state changed; a frame without it leaves the hub's list as it is.
+- A `repo` of owner `local-file` is a file the host added on the PC (ruling B64); there is nothing to fetch. `commit` is the first 40 hex of its SHA-256 (of the list of its parts' hashes for a multi-part set). The hub cannot start that import; `download` for the owner is refused with `denied`, `inspect` answers only for an added file, and `delete` forgets it and leaves the file.
 - A download waiting its turn (one runs at a time) is reported as `running` with 0 bytes done.
 - `hello` has no `engine_error`: when an engine error is pending at connect, the agent sends a `status` frame right after `welcome`.
 - `hf_token` travels only in `hello`: a token set or removed while connected reaches the hub at the next connection.

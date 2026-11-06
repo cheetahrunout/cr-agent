@@ -90,6 +90,26 @@ func (m *Manager) Inspect(ctx context.Context, a *protocol.InspectArgs) (*Facts,
 		return nil, errf(protocol.ErrBusy, "too many inspects in a minute")
 	}
 	m.recent = append(m.recent, now)
+	if reservedRepo(a.Repo) { // never Hugging Face, and only a file the host added
+		var e *Entry
+		for _, x := range m.index {
+			if x.imported() && x.State == StateReady && x.Repo == a.Repo && x.Commit == a.Commit {
+				for _, f := range x.Files {
+					if f.Path == a.File {
+						e = x
+					}
+				}
+			}
+		}
+		root := m.dir
+		m.mu.Unlock()
+		m.inspect.Lock()
+		defer m.inspect.Unlock()
+		if ctx.Err() != nil {
+			return nil, errf(protocol.ErrCancelled, "cancelled")
+		}
+		return m.inspectImported(root, e, a.File)
+	}
 	local := ""
 	for _, e := range m.index {
 		if e.State == StateReady && e.Repo == a.Repo && e.Commit == a.Commit {

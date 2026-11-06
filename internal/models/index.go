@@ -64,6 +64,9 @@ func (e *Entry) valid() bool {
 			return false
 		}
 	}
+	if reservedRepo(e.Repo) {
+		return e.validImported() // the index is input: nothing may come from it that starts a download
+	}
 	switch e.State {
 	case StateDownloading, StateAwaiting, StateDenied, StateReady, StateError, StateMissing:
 		return e.State != StateReady || len(e.Files) == len(e.Names)
@@ -71,8 +74,12 @@ func (e *Entry) valid() bool {
 	return false
 }
 
-// dir is <models>\<owner>\<repo>\<commit[:12]>.
+// dir is <models>\<owner>\<repo>\<commit[:12]>; an imported file stays where the host put it, and its
+// path in the index is relative to the model folder itself.
 func (e *Entry) dir(root string) string {
+	if e.imported() {
+		return root
+	}
 	owner, name, _ := strings.Cut(e.Repo, "/")
 	return filepath.Join(root, owner, name, e.Commit[:12])
 }
@@ -138,6 +145,9 @@ func filesPresent(root string, e *Entry) bool {
 // removeFiles deletes an entry's files and partials, then the folders they leave empty, never
 // anything above the model folder and never through a link.
 func removeFiles(root string, e *Entry, log *slog.Logger) {
+	if e.imported() {
+		return // the host's files are the host's (ruling B64)
+	}
 	names := map[string]bool{}
 	for _, n := range e.Names {
 		names[n] = true

@@ -72,6 +72,7 @@ type env struct {
 	started atomic.Int32
 	changes atomic.Int32
 	free    atomic.Uint64
+	hfCalls atomic.Int32 // every request the manager made to Hugging Face
 }
 
 func newEnv(t *testing.T) *env {
@@ -98,7 +99,7 @@ func newEnv(t *testing.T) *env {
 
 func (e *env) open() {
 	e.t.Helper()
-	client, err := hf.New(hf.Options{Transport: e.srv.Transport(), Token: func() string { return "hf_secret" }})
+	client, err := hf.New(hf.Options{Transport: countingTransport{next: e.srv.Transport(), on: func() { e.hfCalls.Add(1) }}, Token: func() string { return "hf_secret" }})
 	if err != nil {
 		e.t.Fatal(err)
 	}

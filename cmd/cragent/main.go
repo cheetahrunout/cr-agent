@@ -135,6 +135,7 @@ type app struct {
 	a          *agent.Agent
 	aRef       atomic.Pointer[agent.Agent]
 	tr         *tray.Tray
+	adding     atomic.Bool // the Add model files dialog or its import is running
 	q          *approve.Queue
 	defaultHub string
 
@@ -262,6 +263,7 @@ func run() int {
 			<-ready
 			ap.trayUp.Store(true)
 			ap.requestRefresh()
+			ap.noticeModelFiles()
 		}()
 		go ap.signalQuit()
 		err := ap.tr.Run(ready)
@@ -744,6 +746,8 @@ func (ap *app) onAction(a tray.Action, arg string) {
 		}
 	case tray.ActSandbox:
 		ap.toggleSandbox()
+	case tray.ActAddModels:
+		ap.addModels()
 	case tray.ActQuit:
 		ap.tr.Close()
 	case tray.ActPending:
@@ -754,6 +758,57 @@ func (ap *app) onAction(a tray.Action, arg string) {
 		if ap.q != nil {
 			ap.q.Open("")
 		}
+	}
+}
+
+// noticeModelFiles says, once at start and passively, that the model folder holds files the host could
+// add. It offers no button and starts nothing: the tray's Add model files… is the only way in.
+func (ap *app) noticeModelFiles() {
+	if ap.mm == nil {
+		return
+	}
+	s := ap.mm.Scan()
+	if n := len(s.Found) + len(s.Refused); n > 0 { // a refused file also needs the host: the dialog says why
+		ap.tr.Notify("Model files found", modelFilesNotice(n))
+	}
+}
+
+func modelFilesNotice(n int) string {
+	what := "1 model file is"
+	if n > 1 {
+		what = fmt.Sprintf("%d model files are", n)
+	}
+	return what + " in the model folder but not added. To use them, choose Add model files in the tray menu."
+}
+
+// addModels is the host's own import of GGUF files from the model folder (ruling B64). Nothing from
+// the hub leads here. onAction runs on its own goroutine, so the hash blocks neither tray nor link.
+func (ap *app) addModels() {
+	if !ap.adding.CompareAndSwap(false, true) {
+		return
+	}
+	defer ap.adding.Store(false)
+	s := ap.mm.Scan()
+	if len(s.Found) == 0 {
+		ui.Info(ui.NothingToAddText(s))
+		return
+	}
+	if len(s.Refused) > 0 {
+		ui.Info(ui.RefusedText(s))
+	}
+	keys, ok := ui.PickModelFiles(s)
+	if !ok || !ui.Confirm(ui.ConfirmAddText(s, keys), "Add") {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := ui.NewProgress(cancel)
+	results := ap.mm.Import(ctx, keys, p.Set)
+	finished := ctx.Err() == nil
+	p.Close()
+	ap.requestRefresh()
+	if finished {
+		ui.Info(ui.ImportResultText(results))
 	}
 }
 

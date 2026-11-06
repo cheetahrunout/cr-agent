@@ -29,6 +29,7 @@ const (
 	ActSandbox       // the host's choice about the engine's low-integrity sandbox
 	ActPending       // a pending approval was chosen from the menu; arg is its id
 	ActNotification  // the notification was clicked
+	ActAddModels     // the host wants to add GGUF files from the model folder
 )
 
 // Pending is a download waiting for the host's Allow or Deny.
@@ -102,6 +103,7 @@ func Menu(s State) []Item {
 	items = append(items,
 		Item{Label: "Hugging Face token…   " + token, Action: ActHFToken},
 		Item{Label: "Model folder…   " + s.ModelsDir, Action: ActModelFolder},
+		Item{Label: "Add model files…", Action: ActAddModels},
 		Item{Separator: true},
 		Item{Label: "Open hub", Action: ActOpenHub},
 		Item{Label: "Open log", Action: ActOpenLog},

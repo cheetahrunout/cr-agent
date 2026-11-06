@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 func NoReparse(root, path string) error {
@@ -44,4 +45,16 @@ func UnderRoot(f *os.File, root string) error {
 		return errors.New("the file resolved outside the folder")
 	}
 	return nil
+}
+
+// Links is how many names an open file has.
+func Links(f *os.File) (uint32, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		return uint32(s.Nlink), nil
+	}
+	return 1, nil
 }

@@ -514,6 +514,8 @@ func (m *Manager) recordHashes(e *Entry) error {
 	if m.o.Store == nil {
 		return errors.New("no store")
 	}
+	m.secrets.Lock()
+	defer m.secrets.Unlock()
 	rec := m.loadHashes()
 	for _, f := range e.Files {
 		rec[hashKey(e, f.Path)] = f.SHA256
@@ -601,6 +603,8 @@ func (m *Manager) remember(repo, commit string, files []string) error {
 	if m.o.Store == nil {
 		return errors.New("no store")
 	}
+	m.secrets.Lock()
+	defer m.secrets.Unlock()
 	a := m.loadApprovals()
 	for _, f := range files {
 		a.Allowed = append(a.Allowed, approval{Repo: repo, Commit: commit, File: f})

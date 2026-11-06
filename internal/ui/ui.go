@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/ncruces/zenity"
 
@@ -80,6 +81,181 @@ func shortCommit(c string) string {
 		return c[:12]
 	}
 	return c
+}
+
+// clean makes a file name safe to show: no control or formatting characters (a right-to-left mark can
+// make one name read as another), and short enough for a dialog.
+func clean(name string) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range name {
+		if n >= 80 {
+			b.WriteString("…")
+			break
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			r = '?'
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
+}
+
+// shorten keeps a name's start and end, where a model file says what it is: its quantization.
+func shorten(name string, width int) string {
+	r := []rune(name)
+	if len(r) <= width {
+		return name
+	}
+	tail := width * 2 / 3
+	return string(r[:width-tail-1]) + "…" + string(r[len(r)-tail:])
+}
+
+// rowWidth is what fits in a row of zenity's list window, which has a fixed size on Windows.
+const rowWidth = 28
+
+// FoundRow is one row of the Add model files list: size and name, shortened to fit. The confirmation
+// after it shows every full name.
+func FoundRow(f models.Found) string {
+	if len(f.Files) > 1 {
+		return fmt.Sprintf("%s · %s (%d parts)", HumanSize(f.Size), shorten(clean(models.FileStem(f.Key)), rowWidth-10), len(f.Files))
+	}
+	return HumanSize(f.Size) + " · " + shorten(clean(f.Key), rowWidth)
+}
+
+// NothingToAddText is what the host reads when nothing can be added.
+func NothingToAddText(s models.Scan) string {
+	text := "There are no new model files to add in\n" + s.Dir + "\n\nCopy GGUF files into that folder, or into one folder inside it, and choose this again."
+	if len(s.Refused) > 0 {
+		text += "\n\n" + RefusedText(s)
+	}
+	return text
+}
+
+// RefusedText says which files cannot be added, and why. Only a file's own name comes from outside the agent.
+func RefusedText(s models.Scan) string {
+	var b strings.Builder
+	b.WriteString("These cannot be added:\n")
+	for i, r := range s.Refused {
+		if i == 6 {
+			fmt.Fprintf(&b, "and %d more\n", len(s.Refused)-i)
+			break
+		}
+		b.WriteString(clean(r.Name) + ": " + r.Why + "\n")
+	}
+	return b.String()
+}
+
+// listRows pairs each row with its key; two files that shorten to one row are told apart by a number.
+func listRows(s models.Scan) ([]string, map[string]string) {
+	rows := make([]string, 0, len(s.Found))
+	key := map[string]string{}
+	for _, f := range s.Found {
+		r := FoundRow(f)
+		for n := 2; key[r] != ""; n++ {
+			r = fmt.Sprintf("%s (%d)", FoundRow(f), n)
+		}
+		rows = append(rows, r)
+		key[r] = f.Key
+	}
+	return rows, key
+}
+
+// PickModelFiles asks which files to add and returns their keys. Nothing is chosen in advance.
+// zenity's list window has a fixed size on Windows, so the options for its size would do nothing.
+func PickModelFiles(s models.Scan) ([]string, bool) {
+	rows, key := listRows(s)
+	sel, err := zenity.ListMultiple("Files to add (Ctrl+click for several):", rows, zenity.Title(title+" · Add model files"),
+		zenity.OKLabel("Next"), zenity.CancelLabel("Cancel"), zenity.DisallowEmpty())
+	if err != nil || len(sel) == 0 {
+		return nil, false
+	}
+	out := make([]string, 0, len(sel))
+	for _, r := range sel {
+		if k, ok := key[r]; ok {
+			out = append(out, k)
+		}
+	}
+	return out, len(out) > 0
+}
+
+// ConfirmAddText names in full what the host is about to approve: this click is the approval M3 asks for.
+func ConfirmAddText(s models.Scan, keys []string) string {
+	var b strings.Builder
+	b.WriteString("Add these files, so that the hub can use them on this PC?\n\n")
+	for _, k := range keys {
+		for _, f := range s.Found {
+			if f.Key != k {
+				continue
+			}
+			b.WriteString(clean(f.Key) + " · " + HumanSize(f.Size))
+			if len(f.Files) > 1 {
+				fmt.Fprintf(&b, " · %d parts", len(f.Files))
+			}
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\nAdd only files you trust: the engine will load them.")
+	return b.String()
+}
+
+// ImportResultText is the summary after an import.
+func ImportResultText(results []models.ImportResult) string {
+	var added, failed []string
+	for _, r := range results {
+		if r.Err == "" {
+			added = append(added, clean(r.Key))
+		} else {
+			failed = append(failed, clean(r.Key)+": "+r.Err)
+		}
+	}
+	var b strings.Builder
+	if len(added) > 0 {
+		b.WriteString("Added, and now listed for this PC in the hub:\n" + strings.Join(added, "\n") + "\n")
+	}
+	if len(failed) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("Not added:\n" + strings.Join(failed, "\n") + "\n")
+	}
+	return b.String()
+}
+
+// Progress is the window that shows an import's hashing. Closing it cancels the import.
+type Progress struct{ dlg zenity.ProgressDialog }
+
+// NewProgress opens the window; onCancel runs if the host closes it. A window that cannot open is no
+// reason to stop: the hash goes on without one.
+func NewProgress(onCancel func()) *Progress {
+	dlg, err := zenity.Progress(zenity.Title(title+" · Add model files"), zenity.MaxValue(100))
+	if err != nil {
+		return &Progress{}
+	}
+	go func() {
+		<-dlg.Done()
+		onCancel()
+	}()
+	return &Progress{dlg: dlg}
+}
+
+// Set shows the file being checked and how far it all got.
+func (p *Progress) Set(file string, done, total int64) {
+	if p.dlg == nil {
+		return
+	}
+	_ = p.dlg.Text("Checking " + clean(file))
+	if total > 0 {
+		_ = p.dlg.Value(int(float64(done) / float64(total) * 99))
+	}
+}
+
+// Close removes the window.
+func (p *Progress) Close() {
+	if p.dlg != nil {
+		_ = p.dlg.Close()
+	}
 }
 
 // ApprovalLabel is the short form for the tray menu and the notification.

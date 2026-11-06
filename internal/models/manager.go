@@ -137,18 +137,21 @@ type Manager struct {
 	o   Options
 	log *slog.Logger
 
-	mu             sync.Mutex
-	dir            string
-	index          map[string]*Entry
-	jobs           map[string]*job
-	paused         bool
-	wake           chan struct{} // closed and replaced when paused changes
-	slot           chan struct{} // one download at a time
-	inspect        sync.Mutex
-	recent         []time.Time            // inspect starts in the last minute
-	hashed         map[string]bool        // files whose SHA-256 this process has checked, by path, hash, size and modified time
-	hashLocks      map[string]*sync.Mutex // one hash at a time per file
-	testBeforeHash func()                 // tests only
+	mu               sync.Mutex
+	dir              string
+	index            map[string]*Entry
+	jobs             map[string]*job
+	paused           bool
+	wake             chan struct{} // closed and replaced when paused changes
+	slot             chan struct{} // one download at a time
+	inspect          sync.Mutex
+	recent           []time.Time            // inspect starts in the last minute
+	hashed           map[string]bool        // files whose SHA-256 this process has checked, by path, hash, size and modified time
+	hashLocks        map[string]*sync.Mutex // one hash at a time per file
+	testBeforeHash   func()                 // tests only
+	testDuringImport func()                 // tests only
+	importing        bool
+	secrets          sync.Mutex // one read-modify-write at a time of the approvals and hashes
 }
 
 var (
@@ -220,6 +223,12 @@ func (m *Manager) open(dir string) error {
 	m.dir, m.index = abs, idx
 	var restart []*Entry
 	for _, e := range idx {
+		if e.imported() {
+			if e.State == StateReady || e.State == StateMissing {
+				e.State = diskState(abs, e)
+			}
+			continue
+		}
 		switch e.State {
 		case StateReady:
 			if !filesPresent(abs, e) {
@@ -251,10 +260,13 @@ func (m *Manager) Dir() string {
 // where they are (ruling B17). Refused while a download is running.
 func (m *Manager) SetDir(dir string) error {
 	m.mu.Lock()
-	busy := len(m.jobs) > 0
+	busy, importing := len(m.jobs) > 0, m.importing
 	m.mu.Unlock()
 	if busy {
 		return errors.New("a download is running; wait for it or cancel it first")
+	}
+	if importing {
+		return errors.New("model files are being added; wait for that or cancel it first")
 	}
 	if err := m.open(dir); err != nil {
 		return err
@@ -335,6 +347,10 @@ func sameRequest(e *Entry, a *protocol.DownloadArgs) bool {
 func (m *Manager) Download(a *protocol.DownloadArgs, onDone func(Outcome)) {
 	if !protocol.ValidModelID(a.ModelID) || !protocol.ValidRepo(a.Repo) || len(a.Files) < 1 || len(a.Files) > 16 {
 		onDone(Outcome{Err: errf(protocol.ErrBadArgs, "invalid download")})
+		return
+	}
+	if reservedRepo(a.Repo) {
+		onDone(Outcome{Err: &Error{Code: protocol.ErrDenied, Field: "repo", Message: "this is a file the host added on the PC; only the host can add it again"}})
 		return
 	}
 	for _, f := range a.Files {
@@ -500,6 +516,14 @@ func (m *Manager) Delete(modelID string, loaded bool) *Error {
 	dir := m.dir
 	m.saveLocked()
 	m.mu.Unlock()
+	if e.imported() { // forgets it; the file stays, and a later scan may offer it again
+		if err := m.forget(e); err != nil {
+			m.log.Warn("the records of a forgotten model could not be removed", "model_id", modelID, "err", err.Error())
+		}
+		m.log.Info("model forgotten; its file stays", "model_id", modelID)
+		m.o.OnChange(true)
+		return nil
+	}
 	removeFiles(dir, e, m.log)
 	m.log.Info("model deleted", "model_id", modelID)
 	m.o.OnChange(true)
@@ -515,6 +539,7 @@ type Loadable struct {
 
 // Resolve returns the file to load for a model id after the GGUF pre-check (§9.2).
 func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
+	m.refreshImported()
 	m.mu.Lock()
 	e := m.index[modelID]
 	dir := m.dir
@@ -535,10 +560,16 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 	}
 	if !m.trusted(e) {
 		m.log.Warn("load refused: neither an allowlisted publisher nor a stored approval", "model_id", modelID)
+		if e.imported() {
+			return nil, errf(protocol.ErrDenied, "this PC's host did not add this file; only the host can, on the PC")
+		}
 		return nil, errf(protocol.ErrDenied, "this PC's host did not allow this model; download it again to be asked")
 	}
 	if !m.recorded(e) {
 		m.log.Warn("load refused: this agent has no record of downloading this model", "model_id", modelID)
+		if e.imported() {
+			return nil, errf(protocol.ErrDenied, "this PC has no record of this file; only the host can add it again, on the PC")
+		}
 		return nil, errf(protocol.ErrDenied, "this PC has no record of downloading this model; download it again")
 	}
 	if err := noReparse(dir, filepath.Dir(path)); err != nil {
@@ -604,11 +635,20 @@ func (m *Manager) checkHash(e *Entry, path string, f protocol.LocalFile) *Error 
 		m.mu.Lock()
 		if m.index[e.ModelID] == e {
 			e.State = StateError
+			if e.imported() {
+				e.State = StateChanged
+				if errors.Is(serr, os.ErrNotExist) {
+					e.State = StateMissing
+				}
+			}
 			m.saveLocked()
 		}
 		m.mu.Unlock()
 		m.log.Error("load refused: a model file changed since it was downloaded", "model_id", e.ModelID)
 		m.o.OnChange(true)
+		if e.imported() {
+			return errf(protocol.ErrHashMismatch, "a file the host added has changed; only the host can add it again, on the PC")
+		}
 		return errf(protocol.ErrHashMismatch, "a model file does not match its SHA-256; download it again")
 	}
 	m.log.Info("model file hashed before its first load", "model_id", e.ModelID, "ms", time.Since(t0).Milliseconds())

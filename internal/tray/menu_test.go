@@ -33,7 +33,7 @@ func TestMenu(t *testing.T) {
 		Pending: []Pending{{ID: "wizard-x", Label: "wizard-org/Wizard-X-GGUF (8.0 GB)"}}}
 	items := Menu(s)
 	got := labels(items)
-	for _, part := range []string{"(CR Agent)", "(Connected · sharing · in use)", "Install update 0.2.1…", "run it without…", "\nPause hosting (frees your GPU)\n",
+	for _, part := range []string{"(CR Agent)", "(Connected · sharing · in use)", "Install update 0.2.1…", "use low integrity…", "\nPause hosting (frees your GPU)\n",
 		"Waiting for you: wizard-org/Wizard-X-GGUF (8.0 GB)…", "Pair again…", "Hugging Face token…   set"} {
 		if !strings.Contains(got, part) {
 			t.Errorf("missing %q in\n%s", part, got)
@@ -70,8 +70,18 @@ func TestUpdateAndSandboxItems(t *testing.T) {
 	if it := find(State{UpdateAvailable: "0.2.1"}, ActInstallUpdate); it == nil || it.Arg != "0.2.1" || it.Disabled {
 		t.Fatalf("update item %+v", it)
 	}
-	if it := find(State{SandboxOff: true}, ActSandbox); it == nil || !strings.Contains(it.Label, "again") {
+	if it := find(State{LowIntegrity: true}, ActSandbox); it == nil || !strings.Contains(it.Label, "again") || !strings.Contains(it.Label, "read your files") {
 		t.Fatalf("sandbox item %+v", it)
+	}
+	if it := find(State{SandboxBlocked: true}, ActSandbox); it == nil || !strings.Contains(it.Label, "low integrity") {
+		t.Fatalf("offer %+v", it)
+	}
+	for _, s := range []State{{LowIntegrity: true}, {SandboxBlocked: true}} {
+		for _, it := range Menu(s) {
+			if strings.Contains(strings.ToLower(it.Label), "without") || strings.Contains(strings.ToLower(it.Label), "normal") {
+				t.Fatalf("offers something weaker: %q", it.Label)
+			}
+		}
 	}
 }
 

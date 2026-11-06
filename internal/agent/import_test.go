@@ -19,6 +19,7 @@ import (
 	"github.com/cheetahrunout/cr-agent/internal/link"
 	"github.com/cheetahrunout/cr-agent/internal/models"
 	"github.com/cheetahrunout/cr-agent/internal/store"
+	"github.com/cheetahrunout/cr-agent/internal/supervisor"
 )
 
 const importSettings = `"settings":{"ctx":4096,"gpu_layers":"all","threads":4,"kv_type":"f16","flash_attn":"on"}`
@@ -136,6 +137,11 @@ func TestImportRealEngine(t *testing.T) {
 	if engineDir == "" || model == "" {
 		t.Skip("CRAGENT_ENGINE_DIR and CRAGENT_TEST_GGUF not set")
 	}
+	t.Run("appcontainer", func(t *testing.T) { realImport(t, engineDir, model, supervisor.LevelAppContainer) })
+	t.Run("low_integrity", func(t *testing.T) { realImport(t, engineDir, model, supervisor.LevelLowIntegrity) })
+}
+
+func realImport(t *testing.T, engineDir, model string, level supervisor.Level) {
 	home := t.TempDir()
 	st, err := store.Open(home)
 	if err != nil {
@@ -171,12 +177,18 @@ func TestImportRealEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mm.Close()
-	a = New(Config{Version: "0.1.0", LlamaTag: "test", LogicalCores: 8, Log: log, EngineDir: engineDir, Models: mm, Store: st, LowIL: true,
+	a = New(Config{Version: "0.1.0", LlamaTag: "test", LogicalCores: 8, Log: log, EngineDir: engineDir, Models: mm, Store: st, ModelGrant: mm.Dir,
 		GPUInUse: func(ctx context.Context, pid uint32) (bool, error) {
 			pids, err := hw.ComputePIDs(ctx)
 			return pids[pid], err
 		}})
 	defer a.Shutdown()
+	if level == supervisor.LevelLowIntegrity {
+		a.AllowLowIntegrity(true) // what the host's click in the tray does
+	}
+	if a.Level() != level {
+		t.Fatalf("level %v", a.Level())
+	}
 	hubs := make(chan *hub, 2)
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(rw, r, nil)
@@ -230,6 +242,12 @@ func TestImportRealEngine(t *testing.T) {
 	if r["low_il"] != true || r["cuda_context"] != true {
 		t.Fatalf("the engine is not on the GPU in its sandbox: %v", r)
 	}
+	// Which level really ran shows in how the agent reaches it: only the AppContainer has no port.
+	base, _, _, ok := a.target()
+	if !ok || strings.Contains(base, "127.0.0.1") != (level == supervisor.LevelLowIntegrity) {
+		t.Fatalf("level %v reached at %s", level, base)
+	}
+	t.Logf("level %v, reached at %s", level, base)
 	h.send(cmdLine("C3", "unload", ""))
 	h.until("unload", time.Minute, isFor("C3"))
 	h.send(cmdLine("C4", "delete", `"model_id":"`+lm.ModelID+`"`))

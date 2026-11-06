@@ -26,7 +26,7 @@ const (
 	ActAbout
 	ActQuit
 	ActInstallUpdate // the verified latest version; arg is the version
-	ActSandbox       // the host's choice about the engine's low-integrity sandbox
+	ActSandbox       // the host's choice between the AppContainer and low integrity
 	ActPending       // a pending approval was chosen from the menu; arg is its id
 	ActNotification  // the notification was clicked
 	ActAddModels     // the host wants to add GGUF files from the model folder
@@ -50,8 +50,8 @@ type State struct {
 	Version   string
 	// UpdateAvailable is the version the agent's own daily check verified, never one the hub named.
 	UpdateAvailable string
-	SandboxBlocked  bool // CUDA does not work under low integrity here: offer the opt-in
-	SandboxOff      bool // the host chose to run the engine outside the sandbox
+	SandboxBlocked  bool // the AppContainer does not work here: offer the opt-in
+	LowIntegrity    bool // the host chose low integrity: say so, and offer the way back
 }
 
 // Item is one menu row.
@@ -82,10 +82,10 @@ func Menu(s State) []Item {
 		items = append(items, Item{Label: "Install update " + s.UpdateAvailable + "…", Action: ActInstallUpdate, Arg: s.UpdateAvailable})
 	}
 	switch {
-	case s.SandboxOff:
-		items = append(items, Item{Label: "Run the engine in its sandbox again…", Action: ActSandbox})
+	case s.LowIntegrity:
+		items = append(items, Item{Label: "Low integrity: the engine can read your files. Use its sandbox again…", Action: ActSandbox})
 	case s.SandboxBlocked:
-		items = append(items, Item{Label: "The engine cannot use the GPU in its sandbox: run it without…", Action: ActSandbox})
+		items = append(items, Item{Label: "The engine's sandbox does not work on this PC: use low integrity…", Action: ActSandbox})
 	}
 	items = append(items, Item{Separator: true})
 	if s.Paired {

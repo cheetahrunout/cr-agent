@@ -16,6 +16,7 @@ import (
 	"github.com/cheetahrunout/cr-agent/internal/models"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
 	"github.com/cheetahrunout/cr-agent/internal/store"
+	"github.com/cheetahrunout/cr-agent/internal/supervisor"
 	"github.com/cheetahrunout/cr-agent/internal/updater"
 )
 
@@ -121,21 +122,20 @@ func TestLogRotatesInTheWriter(t *testing.T) {
 // Finding L7: every flag that points the agent at another engine, key or model, or weakens the
 // sandbox, is named, and a release build refuses to start with any of them.
 func TestDebugOnlyFlags(t *testing.T) {
-	clean := options{approve: "ask", lowIL: true}
+	clean := options{approve: "ask"}
 	if set := debugOnlyFlags(clean); len(set) != 0 {
 		t.Fatalf("a plain start names %v", set)
 	}
 	for name, o := range map[string]options{
-		"--engine":       {approve: "ask", lowIL: true, engine: "x"},
-		"--key":          {approve: "ask", lowIL: true, key: "x"},
-		"--model":        {approve: "ask", lowIL: true, model: "x"},
-		"--model-id":     {approve: "ask", lowIL: true, modelID: "x"},
-		"--load":         {approve: "ask", lowIL: true, load: true},
-		"--low-il=false": {approve: "ask"},
-		"--no-mem-cap":   {approve: "ask", lowIL: true, noMemCap: true},
-		"--hf-base":      {approve: "ask", lowIL: true, hfBase: "x"},
-		"--release-base": {approve: "ask", lowIL: true, releaseBase: "x"},
-		"--approve":      {approve: "allow", lowIL: true},
+		"--engine":       {approve: "ask", engine: "x"},
+		"--key":          {approve: "ask", key: "x"},
+		"--model":        {approve: "ask", model: "x"},
+		"--model-id":     {approve: "ask", modelID: "x"},
+		"--load":         {approve: "ask", load: true},
+		"--no-mem-cap":   {approve: "ask", noMemCap: true},
+		"--hf-base":      {approve: "ask", hfBase: "x"},
+		"--release-base": {approve: "ask", releaseBase: "x"},
+		"--approve":      {approve: "allow"},
 	} {
 		if set := debugOnlyFlags(o); len(set) != 1 || set[0] != name {
 			t.Errorf("%s: %v", name, set)
@@ -215,5 +215,47 @@ func TestImportAlwaysTells(t *testing.T) {
 	}, func() { closed = true }, func(s string) { told = append(told, s) })
 	if !closed || len(told) != 1 || !strings.Contains(told[0], "Added") || !strings.Contains(told[0], "a.gguf") || !strings.Contains(told[0], "b.gguf: cancelled") {
 		t.Fatalf("closed %v, told %q", closed, told)
+	}
+}
+
+func TestUnderFolder(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	for dir, want := range map[string]bool{
+		home:                                   true,
+		filepath.Join(home, "models"):          true,
+		filepath.Join(home, "models", "sub"):   true,
+		filepath.Dir(home):                     false,
+		home + "-other":                        false,
+		filepath.Join(home, "..", "elsewhere"): false,
+	} {
+		if underFolder(dir, home) != want {
+			t.Errorf("%s: %v", dir, !want)
+		}
+	}
+}
+
+// The question says what changes and for whom, and names the folder.
+func TestModelFolderQuestion(t *testing.T) {
+	q := modelFolderQuestion(`D:\\Models`)
+	for _, want := range []string{`D:\\Models`, "read-only", "only"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("missing %q: %s", want, q)
+		}
+	}
+}
+
+// The opt-in says plainly what it gives up, and About says the true level.
+func TestOptInSaysWhatItGivesUp(t *testing.T) {
+	q := lowIntegrityQuestion()
+	for _, want := range []string{"low integrity", "read your files", "keys", "internet", "cannot change your files"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("missing %q: %s", want, q)
+		}
+	}
+	if strings.Contains(strings.ToLower(q), "normal") || strings.Contains(strings.ToLower(q), "without") {
+		t.Errorf("speaks of something weaker: %s", q)
+	}
+	if !strings.Contains(isolationText(supervisor.LevelAppContainer), "AppContainer") || !strings.Contains(isolationText(supervisor.LevelLowIntegrity), "read your files") {
+		t.Error("the About text does not say the level")
 	}
 }

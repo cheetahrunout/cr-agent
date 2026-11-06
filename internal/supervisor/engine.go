@@ -29,11 +29,14 @@ type Config struct {
 	ModelPath string
 	Alias     string
 	Settings  protocol.Settings
-	LowIL     bool
-	GPUSelect string        // "" or "all": every GPU; "0".."7": only that one (CUDA_VISIBLE_DEVICES)
-	MemLimit  uint64        // job memory cap, 0 = none
-	Deadline  time.Duration // load deadline (ruling B28: 5 min)
-	Log       *slog.Logger
+	Level     Level // how the engine is isolated; the zero value is the strongest
+	// ModelGrant is a model folder the agent may let the AppContainer read: its own, or one the host allowed.
+	// Empty for any other: then the sandbox can read the model only if the folder already allows it.
+	ModelGrant string
+	GPUSelect  string        // "" or "all": every GPU; "0".."7": only that one (CUDA_VISIBLE_DEVICES)
+	MemLimit   uint64        // job memory cap, 0 = none
+	Deadline   time.Duration // load deadline (ruling B28: 5 min)
+	Log        *slog.Logger
 }
 
 // Engine is a running llama-server.
@@ -43,6 +46,7 @@ type Engine struct {
 	key     string
 	alias   string
 	port    int
+	socket  string
 	log     *slog.Logger
 	Started time.Duration // spawn to /health 200
 
@@ -52,10 +56,35 @@ type Engine struct {
 	pumpDone   chan struct{}
 }
 
-// ErrLowILUnavailable means Windows refused to create the process with the low-integrity token, for
-// a reason of the token itself, before any of the child ran. It is the only failure after which the
-// agent may start the engine at normal integrity: nothing a model does can cause it.
-var ErrLowILUnavailable = errors.New("the low-integrity token cannot be used on this PC")
+// Level is how the engine is isolated. There are these two and nothing weaker: no path in the agent
+// starts the engine at normal integrity. Both run at low integrity, so a process at either level cannot
+// change the host's files.
+type Level int
+
+const (
+	// LevelAppContainer is the default: an AppContainer with no capabilities, reached over a Unix socket.
+	LevelAppContainer Level = iota
+	// LevelLowIntegrity is the host's own opt-in on a PC where the AppContainer does not work: a low-integrity
+	// copy of the host's token, reached on loopback. The engine can then read the host's files, open
+	// DPAPI blobs and connect out.
+	LevelLowIntegrity
+)
+
+func (l Level) String() string {
+	switch l {
+	case LevelAppContainer:
+		return "appcontainer"
+	case LevelLowIntegrity:
+		return "low_integrity"
+	}
+	return "unknown"
+}
+
+// ErrSandboxUnavailable means the isolation asked for could not be set up on this PC, before any of the
+// child ran, so no model or hub can have caused it. It is an engine error like any other, never a reason to
+// start with weaker isolation (ruling B63). For the AppContainer it lets the agent offer the host's opt-in;
+// for low integrity there is nothing further to offer.
+var ErrSandboxUnavailable = errors.New("the engine's sandbox cannot be used on this PC")
 
 // ErrEngineExited is returned when llama-server exits before it is healthy.
 var ErrEngineExited = errors.New("engine exited before it was healthy")
@@ -77,32 +106,54 @@ func Start(ctx context.Context, c Config) (*Engine, error) {
 	if st, err := os.Stat(exe); err != nil || st.IsDir() {
 		return nil, fmt.Errorf("llama-server.exe not found in %s", dir)
 	}
-	port, err := freePort()
-	if err != nil {
-		return nil, err
-	}
 	key := randHex(32)
-	l := Launch{ModelPath: c.ModelPath, Alias: c.Alias, Port: port, APIKey: key, Settings: c.Settings}
+	l := Launch{ModelPath: c.ModelPath, Alias: c.Alias, APIKey: key, Settings: c.Settings}
+	var port int
+	base := ""
+	if c.Level == LevelAppContainer {
+		if err := prepareSandbox(dir, c.ModelGrant, c.ModelPath); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrSandboxUnavailable, err)
+		}
+		if l.Socket, err = newSocketPath(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrSandboxUnavailable, err)
+		}
+		base = registerSocket(l.Socket)
+	} else {
+		if port, err = freePort(); err != nil {
+			return nil, err
+		}
+		l.Port = port
+		base = fmt.Sprintf("http://127.0.0.1:%d", port)
+	}
 	deadline := c.Deadline
 	if deadline <= 0 {
 		deadline = 5 * time.Minute
 	}
 
 	t0 := time.Now()
-	p, err := spawn(spawnOptions{Exe: exe, Args: BuildArgs(l), Dir: dir, LowIL: c.LowIL, MemLimit: c.MemLimit, GPUSelect: c.GPUSelect})
+	p, err := spawn(spawnOptions{Exe: exe, Args: BuildArgs(l), Dir: dir, Level: c.Level, MemLimit: c.MemLimit, GPUSelect: c.GPUSelect})
 	if err != nil {
+		forgetSocket(l.Socket)
 		return nil, err
 	}
-	e := &Engine{p: p, base: fmt.Sprintf("http://127.0.0.1:%d", port), key: key, alias: c.Alias, port: port, log: log, pumpDone: make(chan struct{})}
+	e := &Engine{p: p, base: base, key: key, alias: c.Alias, port: port, socket: l.Socket, log: log, pumpDone: make(chan struct{})}
 	go e.pump(p.out)
-	log.Info("engine spawned", "pid", p.PID(), "port", port, "low_il", c.LowIL, "integrity", p.Integrity(),
+	log.Info("engine spawned", "pid", p.PID(), "port", port, "isolation", c.Level.String(), "integrity", p.Integrity(),
 		"mem_cap_mb", c.MemLimit>>20, "ctx", l.Settings.Ctx, "threads", l.Settings.Threads)
 
 	if err := e.waitHealthy(ctx, deadline); err != nil {
 		e.Stop()
 		return nil, err
 	}
-	if owner, err := portOwner(port); err != nil || owner != p.PID() {
+	if l.Socket != "" {
+		if owner, err := socketOwner(l.Socket); err != nil || owner != p.PID() {
+			e.Stop()
+			if err != nil {
+				return nil, fmt.Errorf("the socket's owner cannot be checked: %w", err)
+			}
+			return nil, fmt.Errorf("the socket is not owned by the engine (owner %d)", owner)
+		}
+	} else if owner, err := portOwner(port); err != nil || owner != p.PID() {
 		e.Stop()
 		return nil, fmt.Errorf("port %d is not owned by the engine (owner %d, err %v)", port, owner, err)
 	}
@@ -114,7 +165,7 @@ func Start(ctx context.Context, c Config) (*Engine, error) {
 func (e *Engine) waitHealthy(ctx context.Context, deadline time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: DialEngine}}
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -138,10 +189,52 @@ func (e *Engine) waitHealthy(ctx context.Context, deadline time.Duration) error 
 	}
 }
 
+// A sandboxed engine has a Unix socket, not a port. Its base URL names a host that exists only in this
+// table, so the relay and every other HTTP client keep working with a plain base URL.
+var (
+	socketsMu sync.Mutex
+	sockets   = map[string]string{}
+)
+
+func registerSocket(path string) string {
+	host := "cr-engine-" + randHex(8)
+	socketsMu.Lock()
+	sockets[host+":80"] = path
+	socketsMu.Unlock()
+	return "http://" + host
+}
+
+func forgetSocket(path string) {
+	if path == "" {
+		return
+	}
+	socketsMu.Lock()
+	for k, v := range sockets {
+		if v == path {
+			delete(sockets, k)
+		}
+	}
+	socketsMu.Unlock()
+	os.Remove(path)
+}
+
+// DialEngine is the dialer of every HTTP client that talks to an engine.
+func DialEngine(ctx context.Context, network, addr string) (net.Conn, error) {
+	socketsMu.Lock()
+	path := sockets[addr]
+	socketsMu.Unlock()
+	var d net.Dialer
+	if path != "" {
+		return d.DialContext(ctx, "unix", path)
+	}
+	return d.DialContext(ctx, network, addr)
+}
+
 var reCUDADevice = regexp.MustCompile(`(?m)^\s*CUDA\d+:`)
 
-// ProbeCUDA asks the engine, under the low-integrity token, with no model and no GPU selection,
-// whether it sees a CUDA device: llama-server --list-devices. Nothing the hub sends has a part in it.
+// ProbeCUDA asks the engine, in the AppContainer, with no model and no GPU selection, whether it sees a
+// CUDA device: llama-server --list-devices. Nothing the hub sends has a part in it. A list that does not
+// come in time shows no device, the same as a list without one.
 func ProbeCUDA(engineDir string) (bool, error) {
 	if engineDir == "" {
 		return false, errors.New("no engine folder")
@@ -150,7 +243,10 @@ func ProbeCUDA(engineDir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	p, err := spawn(spawnOptions{Exe: filepath.Join(dir, "llama-server.exe"), Args: []string{"--list-devices"}, Dir: dir, LowIL: true})
+	if err := prepareSandbox(dir, "", ""); err != nil {
+		return false, err
+	}
+	p, err := spawn(spawnOptions{Exe: filepath.Join(dir, "llama-server.exe"), Args: []string{"--list-devices"}, Dir: dir, Level: LevelAppContainer})
 	if err != nil {
 		return false, err
 	}
@@ -165,7 +261,7 @@ func ProbeCUDA(engineDir string) (bool, error) {
 	case b := <-out:
 		return reCUDADevice.Match(b), nil
 	case <-time.After(30 * time.Second):
-		return false, errors.New("the device list did not come")
+		return false, nil
 	}
 }
 
@@ -195,6 +291,7 @@ func (e *Engine) Stop() {
 	case <-time.After(2 * time.Second):
 	}
 	e.p.out.Close()
+	forgetSocket(e.socket)
 	e.log.Info("engine stopped", "pid", e.p.PID(), "suppressed_lines", e.suppressed.Load(), "peak_job_mb", peak>>20)
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,12 +26,11 @@ func sandboxSettings(layers int) protocol.Settings {
 	return protocol.Settings{Ctx: 4096, GPULayers: protocol.Layers(layers), Threads: 2, KVType: "f16", FlashAttn: "auto"}
 }
 
-// Finding H1: a model that makes the engine exit under the low-integrity token must not get a second
-// start at the user's full integrity.
-func TestCrashUnderLowILIsNeverRetriedOutside(t *testing.T) {
+// Finding H1: a model that makes the engine exit must not get a second start with weaker isolation.
+func TestCrashIsNeverRetriedWeaker(t *testing.T) {
 	var runs []bool
-	a := New(Config{Version: "0.1.0", LowIL: true, Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
-		runs = append(runs, c.LowIL)
+	a := New(Config{Version: "0.1.0", Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+		runs = append(runs, c.Level == supervisor.LevelAppContainer)
 		return nil, fmt.Errorf("%w (exit code 1)", supervisor.ErrEngineExited)
 	}})
 	defer a.Shutdown()
@@ -48,11 +49,11 @@ func TestCrashUnderLowILIsNeverRetriedOutside(t *testing.T) {
 // A failed CUDA check is an engine error with its own code; only the host's click changes the token.
 func TestNoCUDAIsAnErrorUntilTheHostOptsIn(t *testing.T) {
 	var runs []bool
-	a := New(Config{Version: "0.1.0", LowIL: true,
+	a := New(Config{Version: "0.1.0",
 		GPUInUse:  func(context.Context, uint32) (bool, error) { return false, nil },
 		ProbeCUDA: func() (bool, error) { return false, nil }, // the engine alone sees no device: it is real
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
-			runs = append(runs, c.LowIL)
+			runs = append(runs, c.Level == supervisor.LevelAppContainer)
 			return &bareEngine{done: make(chan struct{})}, nil
 		}})
 	defer a.Shutdown()
@@ -74,7 +75,7 @@ func TestNoCUDAIsAnErrorUntilTheHostOptsIn(t *testing.T) {
 		t.Fatalf("second load without the opt-in: runs %v err %v", runs, err)
 	}
 	// The host clicks.
-	a.AllowNormalIntegrity(true)
+	a.AllowLowIntegrity(true)
 	if a.SandboxBlocked() {
 		t.Fatal("still offered after the click")
 	}
@@ -87,10 +88,10 @@ func TestNoCUDAIsAnErrorUntilTheHostOptsIn(t *testing.T) {
 // The check that cannot run says nothing about CUDA: the engine stays in the sandbox.
 func TestCheckThatCannotRunKeepsTheSandbox(t *testing.T) {
 	var runs []bool
-	a := New(Config{Version: "0.1.0", LowIL: true,
+	a := New(Config{Version: "0.1.0",
 		GPUInUse: func(context.Context, uint32) (bool, error) { return false, errors.New("nvml not there") },
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
-			runs = append(runs, c.LowIL)
+			runs = append(runs, c.Level == supervisor.LevelAppContainer)
 			return &bareEngine{done: make(chan struct{})}, nil
 		}})
 	defer a.Shutdown()
@@ -102,20 +103,49 @@ func TestCheckThatCannotRunKeepsTheSandbox(t *testing.T) {
 	}
 }
 
-// Windows refusing the token, before anything ran, is the one case for a normal-integrity start.
-func TestTokenRefusalFallsBack(t *testing.T) {
+// A sandbox that cannot be set up is an engine error and never a start with weaker isolation (ruling
+// B63). No hub or model can cause it, so it does raise the host's own offer.
+func TestSandboxUnavailableIsAnEngineError(t *testing.T) {
 	var runs []bool
-	a := New(Config{Version: "0.1.0", LowIL: true, Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
-		runs = append(runs, c.LowIL)
-		if c.LowIL {
-			return nil, fmt.Errorf("%w: CreateProcessAsUser: privilege not held", supervisor.ErrLowILUnavailable)
+	a := New(Config{Version: "0.1.0", Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+		runs = append(runs, c.Level == supervisor.LevelAppContainer)
+		if c.Level == supervisor.LevelAppContainer {
+			return nil, fmt.Errorf("%w: CreateAppContainerProfile failed", supervisor.ErrSandboxUnavailable)
 		}
 		return &bareEngine{done: make(chan struct{})}, nil
 	}})
 	defer a.Shutdown()
-	res, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
-	if err != nil || len(runs) != 2 || runs[1] || res["low_il"] != false {
-		t.Fatalf("runs %v res %v err %v", runs, res, err)
+	_, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
+	if !errors.Is(err, supervisor.ErrSandboxUnavailable) || len(runs) != 1 || !runs[0] {
+		t.Fatalf("runs %v err %v", runs, err)
+	}
+	if !a.SandboxBlocked() {
+		t.Fatal("the host was not offered the way out")
+	}
+	// Only the host's own choice changes that.
+	a.AllowLowIntegrity(true)
+	if a.Level() != supervisor.LevelLowIntegrity {
+		t.Fatal("still in the AppContainer after the host's choice")
+	}
+	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0)); err != nil || len(runs) != 2 || runs[1] {
+		t.Fatalf("after the opt-in: runs %v err %v", runs, err)
+	}
+}
+
+// The folder the agent may grant reaches the engine's start.
+func TestModelGrantReachesTheEngine(t *testing.T) {
+	var got string
+	a := New(Config{Version: "0.1.0", ModelGrant: func() string { return `C:\own\models` },
+		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			got = c.ModelGrant
+			return &bareEngine{done: make(chan struct{})}, nil
+		}})
+	defer a.Shutdown()
+	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0)); err != nil {
+		t.Fatal(err)
+	}
+	if got != `C:\own\models` {
+		t.Fatalf("got %q", got)
 	}
 }
 
@@ -137,24 +167,24 @@ func TestGPUSelectReachesTheEngine(t *testing.T) {
 }
 
 // The host's choice is remembered per PC, and no frame from the hub can make it (finding H1).
-func TestNormalIntegrityIsTheHostsOwn(t *testing.T) {
+func TestLowIntegrityIsTheHostsOwn(t *testing.T) {
 	st, err := store.OpenWith(t.TempDir(), plain{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := New(Config{Version: "0.1.0", LowIL: true, Store: st})
-	if a.NormalIntegrity() {
+	a := New(Config{Version: "0.1.0", Store: st})
+	if a.Level() != supervisor.LevelAppContainer {
 		t.Fatal("on by default")
 	}
 	a.Shutdown()
-	st.Update(func(c *store.Config) { c.EngineNormalIntegrity = true })
-	b := New(Config{Version: "0.1.0", LowIL: true, Store: st})
+	st.Update(func(c *store.Config) { c.EngineLowIntegrity = true })
+	b := New(Config{Version: "0.1.0", Store: st})
 	defer b.Shutdown()
-	if !b.NormalIntegrity() {
+	if b.Level() != supervisor.LevelLowIntegrity {
 		t.Fatal("not remembered")
 	}
 	// The config command has no such field, and the decoder is strict.
-	for _, field := range []string{"engine_normal_integrity", "low_il", "sandbox"} {
+	for _, field := range []string{"engine_low_integrity", "engine_normal_integrity", "low_il", "sandbox", "isolation"} {
 		_, err := protocol.Decode([]byte(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T1","op":"config","args":{"` + field + `":true}}`))
 		if err == nil {
 			t.Errorf("config{%s} was accepted", field)
@@ -165,7 +195,6 @@ func TestNormalIntegrityIsTheHostsOwn(t *testing.T) {
 // The hub hears why, with the code.
 func TestNoCUDACodeReachesTheHub(t *testing.T) {
 	w := newWorldWith(t, func(c *Config) {
-		c.LowIL = true
 		c.GPUInUse = func(context.Context, uint32) (bool, error) { return false, nil }
 	})
 	h, _ := w.connect()
@@ -183,7 +212,7 @@ func TestNoCUDACodeReachesTheHub(t *testing.T) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.started) != 1 || !w.started[0].LowIL {
+	if len(w.started) != 1 || w.started[0].Level != supervisor.LevelAppContainer {
 		t.Fatalf("starts: %d", len(w.started))
 	}
 }
@@ -193,7 +222,7 @@ func TestNoCUDACodeReachesTheHub(t *testing.T) {
 func TestHubCannotRaiseTheOffer(t *testing.T) {
 	probes := 0
 	gpuOK := false
-	a := New(Config{Version: "0.1.0", LowIL: true,
+	a := New(Config{Version: "0.1.0",
 		GPUInUse:  func(context.Context, uint32) (bool, error) { return gpuOK, nil },
 		ProbeCUDA: func() (bool, error) { probes++; return true, nil },
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
@@ -251,4 +280,93 @@ func TestLoadSlotIsHeldFromTheStart(t *testing.T) {
 	}
 	close(release)
 	h.until("the first load", 5*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.done" && m["id"] == "c-01JCKZ3Q9X8YB7N6M5P4R3S2T4" })
+}
+
+// Nothing weaker than low integrity exists: a failure there is an engine error and no further offer.
+func TestNoOfferBelowLowIntegrity(t *testing.T) {
+	var levels []supervisor.Level
+	probes := 0
+	gpu := func(context.Context, uint32) (bool, error) { return false, nil }
+	a := New(Config{Version: "0.1.0", GPUInUse: gpu,
+		ProbeCUDA: func() (bool, error) { probes++; return false, nil },
+		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			levels = append(levels, c.Level)
+			return &bareEngine{done: make(chan struct{})}, nil
+		}})
+	defer a.Shutdown()
+	a.AllowLowIntegrity(true)
+	// CUDA fails at low integrity.
+	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(1)); !errors.Is(err, errNoCUDAUnderLowIL) {
+		t.Fatal(err)
+	}
+	if a.SandboxBlocked() || probes != 0 || len(levels) != 1 || levels[0] != supervisor.LevelLowIntegrity {
+		t.Fatalf("offer %v, probes %d, levels %v", a.SandboxBlocked(), probes, levels)
+	}
+	// The token itself is refused.
+	a.cfg.Start = func(ctx context.Context, c supervisor.Config) (Engine, error) {
+		levels = append(levels, c.Level)
+		return nil, fmt.Errorf("%w: low integrity: privilege not held", supervisor.ErrSandboxUnavailable)
+	}
+	_, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
+	if !errors.Is(err, supervisor.ErrSandboxUnavailable) || a.SandboxBlocked() || len(levels) != 2 || levels[1] != supervisor.LevelLowIntegrity {
+		t.Fatalf("err %v, offer %v, levels %v", err, a.SandboxBlocked(), levels)
+	}
+	if !strings.Contains(a.SandboxResult(), "low_integrity") || a.Snapshot(true).Engine != protocol.EngineError {
+		t.Fatalf("result %q, engine %q", a.SandboxResult(), a.Snapshot(true).Engine)
+	}
+}
+
+// An engine that does not start in the AppContainer raises the offer only on the agent's own probe, so a
+// model that crashes on purpose gets nothing, while a PC where the sandbox really fails gets its way out.
+func TestStartFailureAsksTheProbe(t *testing.T) {
+	found := true
+	a := New(Config{Version: "0.1.0", ProbeCUDA: func() (bool, error) { return found, nil },
+		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			return nil, fmt.Errorf("%w (exit code 1)", supervisor.ErrEngineExited)
+		}})
+	defer a.Shutdown()
+	a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
+	if a.SandboxBlocked() {
+		t.Fatal("a crash with a working GPU raised the offer")
+	}
+	found = false
+	a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
+	if !a.SandboxBlocked() {
+		t.Fatal("no way out when the sandbox shows no GPU")
+	}
+}
+
+// low_il tells the truth at both levels, because both are low integrity and nothing lower is started.
+func TestLowILIsTrueAtBothLevels(t *testing.T) {
+	a := New(Config{Version: "0.1.0", Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+		return &bareEngine{done: make(chan struct{})}, nil
+	}})
+	defer a.Shutdown()
+	for _, low := range []bool{false, true} {
+		a.AllowLowIntegrity(low)
+		res, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
+		if err != nil || res["low_il"] != true {
+			t.Fatalf("low %v: %v %v", low, res, err)
+		}
+		if _, extra := res["isolation"]; extra {
+			t.Fatal("a field the schema does not name")
+		}
+	}
+}
+
+// An older version's setting is not carried over: it stood for something that no longer exists.
+func TestOldNormalIntegritySettingIsNotRead(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(`{"engine_normal_integrity":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.OpenWith(home, plain{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(Config{Version: "0.1.0", Store: st})
+	defer a.Shutdown()
+	if a.Level() != supervisor.LevelAppContainer {
+		t.Fatal("the old setting was read")
+	}
 }

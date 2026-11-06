@@ -71,3 +71,37 @@ func TestStartNeedsAnEngineFolder(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// In the sandbox the engine listens on a Unix socket and on nothing else.
+func TestSocketArgs(t *testing.T) {
+	args := BuildArgs(Launch{ModelPath: "m.gguf", Alias: "m", Socket: `C:\\x\\e-1.sock`, APIKey: "k", Port: 5555})
+	line := strings.Join(args, " ")
+	if !strings.Contains(line, `--host C:\\x\\e-1.sock`) || strings.Contains(line, "--port") || strings.Contains(line, "127.0.0.1") {
+		t.Fatalf("args: %s", line)
+	}
+	if !strings.Contains(line, "--cors-origins "+socketOrigin) {
+		t.Fatalf("origin: %s", line)
+	}
+}
+
+// DialEngine knows the sandboxed engines, and leaves every other address alone.
+func TestDialEngineTable(t *testing.T) {
+	base := registerSocket("some-path.sock")
+	host := strings.TrimPrefix(base, "http://") + ":80"
+	socketsMu.Lock()
+	got := sockets[host]
+	socketsMu.Unlock()
+	if got != "some-path.sock" {
+		t.Fatalf("%q", got)
+	}
+	forgetSocket("some-path.sock")
+	socketsMu.Lock()
+	n := len(sockets)
+	socketsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d left", n)
+	}
+	if forgetSocket(""); len(sockets) != 0 {
+		t.Fatal("an empty path changed the table")
+	}
+}

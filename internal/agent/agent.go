@@ -45,7 +45,6 @@ type Config struct {
 	// SupportedArchs is the architecture list of the pinned engine, reported in hello.
 	SupportedArchs []string
 	EngineDir      string
-	LowIL          bool
 	MemLimit       uint64
 	// LogicalCores bounds threads; n_layer and n_ctx_train come from each model's own header.
 	LogicalCores int
@@ -65,7 +64,10 @@ type Config struct {
 	// ProbeCUDA asks the engine alone, under low integrity, whether it sees a CUDA device. Only its
 	// "no" raises the tray's offer. Default with the real supervisor: supervisor.ProbeCUDA.
 	ProbeCUDA func() (bool, error)
-	HFToken   func() string // absent | present | invalid; nil: not reported
+	// ModelGrant names the model folder the agent may let the sandbox read at a load: its own, or the one
+	// the host allowed. "" means it changes no permissions.
+	ModelGrant func() string
+	HFToken    func() string // absent | present | invalid; nil: not reported
 
 	// OnChange is called when anything the tray shows may have changed. It must not block.
 	OnChange func()
@@ -126,10 +128,10 @@ type Agent struct {
 	paused            bool
 	sleeping          bool
 	config            protocol.ConfigArgs
-	lowILResult       string
+	sandboxResult     string
 	testBeforeResolve func() // tests only
-	sandboxBlocked    bool   // CUDA failed under low integrity: the tray offers the opt-in
-	normalIntegrityOK bool   // the host clicked the opt-in; remembered per PC by the caller
+	sandboxBlocked    bool   // the AppContainer does not work on this PC: the tray offers the opt-in
+	lowIntegrityOK    bool   // the host clicked the opt-in; remembered per PC by the caller
 	hubVersion        string
 	update            *protocol.UpdateStatus // set while an update runs or after one failed
 	updating          bool
@@ -204,7 +206,7 @@ func New(cfg Config) *Agent {
 			g := c.GPUSelect
 			a.config.GPUSelect = &g
 		}
-		a.normalIntegrityOK = c.EngineNormalIntegrity
+		a.lowIntegrityOK = c.EngineLowIntegrity
 	}
 	if a.paused && cfg.Models != nil {
 		cfg.Models.SetPaused(true)
@@ -281,9 +283,19 @@ func (a *Agent) updateAwake() {
 	a.cfg.KeepAwake(want)
 }
 
+// Level is how the next engine will be isolated: the AppContainer, unless the host opted out on this PC.
+func (a *Agent) Level() supervisor.Level {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lowIntegrityOK {
+		return supervisor.LevelLowIntegrity
+	}
+	return supervisor.LevelAppContainer
+}
+
 // wakeCheck is the default check of an engine kept across a sleep: /health, then one token.
 func wakeCheck(ctx context.Context, base, key, alias string) error {
-	c := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 20 * time.Second}
+	c := &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: supervisor.DialEngine}, Timeout: 20 * time.Second}
 	do := func(method, path, body string) error {
 		req, err := http.NewRequestWithContext(ctx, method, base+path, strings.NewReader(body))
 		if err != nil {
@@ -891,56 +903,65 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 		}
 	}
 	a.mu.Lock()
-	useLowIL, gpuSelect := a.cfg.LowIL && !a.normalIntegrityOK, ""
+	level, gpuSelect := supervisor.LevelAppContainer, ""
+	if a.lowIntegrityOK {
+		level = supervisor.LevelLowIntegrity
+	}
 	if a.config.GPUSelect != nil {
 		gpuSelect = *a.config.GPUSelect
 	}
 	a.mu.Unlock()
 	sc := supervisor.Config{EngineDir: a.cfg.EngineDir, ModelPath: path, Alias: modelID,
-		Settings: st, LowIL: useLowIL, GPUSelect: gpuSelect, MemLimit: a.cfg.MemLimit, Log: a.log}
+		Settings: st, Level: level, GPUSelect: gpuSelect, MemLimit: a.cfg.MemLimit, Log: a.log}
+	if a.cfg.ModelGrant != nil {
+		sc.ModelGrant = a.cfg.ModelGrant()
+	}
 	t0 := time.Now()
 	eng, err := a.cfg.Start(lctx, sc)
-	lowIL := sc.LowIL
 	wantGPU := st.GPULayers.All || st.GPULayers.N > 0
 	failure := EngineFailed
-	if sc.LowIL {
-		switch {
-		case errors.Is(err, supervisor.ErrLowILUnavailable):
-			// Windows refused the token before any of the child ran, so no model can have caused this.
-			// This is the one case for a start at normal integrity.
-			a.setLowIL("fallback: Windows refused the low-integrity token")
-			a.log.Warn("the low-integrity token cannot be used on this PC; starting at normal integrity", "err", err.Error())
-			sc.LowIL, lowIL = false, false
-			eng, err = a.cfg.Start(lctx, sc)
-		case err != nil:
-			// The child ran and failed. A model can do that on purpose, so it is never retried outside the sandbox.
-			a.setLowIL("failed: the engine did not start under low integrity")
-		case wantGPU && a.cfg.GPUInUse != nil:
-			ok, cerr := a.cfg.GPUInUse(lctx, eng.PID())
-			switch {
-			case cerr != nil:
-				// The check itself failed. The engine stays where it is, in the sandbox.
-				a.setLowIL("ok: engine healthy under low integrity (CUDA could not be checked)")
-			case !ok:
-				a.setLowIL("failed: the engine holds no CUDA context under low integrity")
-				eng.Stop()
-				eng, err, failure = nil, errNoCUDAUnderLowIL, EngineNoCUDALowIL
-				// This load's settings came from the hub and can fail on purpose (a gpu_select of a GPU the
-				// PC does not have). Only the agent's own probe may raise the offer to leave the sandbox.
-				if a.cfg.ProbeCUDA != nil {
-					found, perr := a.cfg.ProbeCUDA()
-					blocked := perr == nil && !found
-					a.log.Info("CUDA probe under low integrity", "device_found", found, "probe_failed", perr != nil)
-					a.mu.Lock()
-					a.sandboxBlocked = blocked
-					a.mu.Unlock()
-				}
-			default:
-				a.setLowIL("ok: CUDA context present under low integrity")
-			}
-		default:
-			a.setLowIL("ok: engine healthy under low integrity (CUDA not checked)")
+	// The offer to leave the AppContainer. A load's settings come from the hub and a model can crash on
+	// purpose, so only the agent's own probe may raise it. Below the AppContainer nothing is left to offer.
+	probeForOffer := func() {
+		if level != supervisor.LevelAppContainer || a.cfg.ProbeCUDA == nil {
+			return
 		}
+		found, perr := a.cfg.ProbeCUDA()
+		a.log.Info("CUDA probe in the AppContainer", "device_found", found, "probe_failed", perr != nil)
+		a.mu.Lock()
+		a.sandboxBlocked = perr == nil && !found
+		a.mu.Unlock()
+	}
+	switch {
+	case errors.Is(err, supervisor.ErrSandboxUnavailable):
+		// An engine error, never a start with weaker isolation (ruling B63). Nothing from the hub or a
+		// model can cause this, before any of the child ran, so it may raise the host's own offer.
+		a.setSandboxResult("failed: " + level.String() + " cannot be used on this PC")
+		a.log.Error("the engine's isolation cannot be used on this PC", "isolation", level.String(), "err", err.Error())
+		if level == supervisor.LevelAppContainer {
+			a.mu.Lock()
+			a.sandboxBlocked = true
+			a.mu.Unlock()
+		}
+	case err != nil:
+		a.setSandboxResult("failed: the engine did not start at " + level.String())
+		probeForOffer()
+	case wantGPU && a.cfg.GPUInUse != nil:
+		ok, cerr := a.cfg.GPUInUse(lctx, eng.PID())
+		switch {
+		case cerr != nil:
+			// The check itself failed. The engine stays where it is, in the sandbox.
+			a.setSandboxResult("ok: engine healthy at " + level.String() + " (CUDA could not be checked)")
+		case !ok:
+			a.setSandboxResult("failed: the engine holds no CUDA context at " + level.String())
+			eng.Stop()
+			eng, err, failure = nil, errNoCUDAUnderLowIL, EngineNoCUDALowIL
+			probeForOffer()
+		default:
+			a.setSandboxResult("ok: CUDA context present at " + level.String())
+		}
+	default:
+		a.setSandboxResult("ok: engine healthy at " + level.String() + " (CUDA not checked)")
 	}
 	ms := time.Since(t0).Milliseconds()
 	a.mu.Lock()
@@ -960,11 +981,11 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 	}
 	a.engine, a.state = eng, protocol.EngineLoaded
 	a.lastActivity, a.lastOnline = time.Now(), time.Now() // both idle clocks start at the load
-	if lowIL {
-		a.sandboxBlocked = false // the sandbox just worked
-	}
+	a.sandboxBlocked = false                              // the engine just worked at this level
 	a.mu.Unlock()
-	res := map[string]any{"start_ms": ms, "low_il": lowIL}
+	// low_il is true at both levels: an AppContainer is low integrity too, and nothing lower is ever
+	// started. The schema has no field for which level, so the log and the tray say that.
+	res := map[string]any{"start_ms": ms, "low_il": true}
 	if a.cfg.GPUInUse != nil && wantGPU {
 		onGPU, err := a.cfg.GPUInUse(lctx, eng.PID())
 		res["cuda_context"] = onGPU
@@ -972,7 +993,7 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 			a.log.Warn("engine holds no CUDA context; it is running on the CPU", "err", fmt.Sprint(err))
 		}
 	}
-	a.log.Info("model loaded", "model_id", modelID, "ms", ms, "low_il", lowIL, "cuda_context", res["cuda_context"])
+	a.log.Info("model loaded", "model_id", modelID, "ms", ms, "isolation", level.String(), "low_il", true, "cuda_context", res["cuda_context"])
 	go a.watch(eng)
 	a.sendStatus(false)
 	return res, nil
@@ -984,22 +1005,22 @@ const (
 	EngineNoCUDALowIL = "no_cuda_under_low_integrity"
 )
 
-var errNoCUDAUnderLowIL = errors.New("the engine holds no CUDA context under low integrity")
+var errNoCUDAUnderLowIL = errors.New("the engine holds no CUDA context in its sandbox")
 
-// SandboxBlocked reports that a load failed because CUDA does not work under low integrity on this PC.
-// The tray then offers the host the opt-in.
+// SandboxBlocked reports that the AppContainer does not work on this PC, by the agent's own evidence. The
+// tray then offers the host the opt-in to low integrity.
 func (a *Agent) SandboxBlocked() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.sandboxBlocked
 }
 
-// AllowNormalIntegrity records the host's own choice to run the engine outside the low-integrity
-// sandbox on this PC. It is reached only from the tray, after the host clicked; no frame from the hub
-// leads here.
-func (a *Agent) AllowNormalIntegrity(ok bool) {
+// AllowLowIntegrity records the host's own choice to run the engine at low integrity instead of in
+// the AppContainer on this PC. It is reached only from the tray, after the host clicked; no frame from the
+// hub leads here. Nothing weaker than low integrity exists.
+func (a *Agent) AllowLowIntegrity(ok bool) {
 	a.mu.Lock()
-	a.normalIntegrityOK = ok
+	a.lowIntegrityOK = ok
 	if ok {
 		a.sandboxBlocked = false
 	}
@@ -1007,25 +1028,18 @@ func (a *Agent) AllowNormalIntegrity(ok bool) {
 	a.cfg.OnChange()
 }
 
-// NormalIntegrity reports the host's choice.
-func (a *Agent) NormalIntegrity() bool {
+func (a *Agent) setSandboxResult(s string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.normalIntegrityOK
-}
-
-func (a *Agent) setLowIL(s string) {
-	a.mu.Lock()
-	a.lowILResult = s
+	a.sandboxResult = s
 	a.mu.Unlock()
-	a.log.Info("low-IL result", "result", s)
+	a.log.Info("sandbox result", "result", s)
 }
 
-// LowILResult reports the outcome of the last low-integrity attempt.
-func (a *Agent) LowILResult() string {
+// SandboxResult reports the outcome of the last start.
+func (a *Agent) SandboxResult() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.lowILResult
+	return a.sandboxResult
 }
 
 // watch notices an engine that exits without being asked to.

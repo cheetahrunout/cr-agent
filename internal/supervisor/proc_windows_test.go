@@ -55,16 +55,20 @@ func TestJobBlocksGrandchildren(t *testing.T) {
 	t.Logf("output: %q", strings.TrimSpace(out))
 }
 
-// The low-IL flag really yields a low-integrity child.
-func TestLowIntegrityChild(t *testing.T) {
+// Both levels really yield a low-integrity child, and no other level starts anything.
+func TestEveryLevelIsLowIntegrity(t *testing.T) {
 	whoami := sys32(t, "whoami.exe")
-	out, code, integrity := runSpawn(t, spawnOptions{Exe: whoami, Args: []string{"/groups"}, Dir: os.TempDir(), LowIL: true})
-	if code != 0 || !strings.Contains(out, "Low Mandatory Level") || integrity != "low" {
-		t.Fatalf("exit %d integrity %s, output %q", code, integrity, out)
+	for _, level := range []Level{LevelAppContainer, LevelLowIntegrity} {
+		out, code, integrity := runSpawn(t, spawnOptions{Exe: whoami, Args: []string{"/groups"}, Dir: os.TempDir(), Level: level})
+		if code != 0 || !strings.Contains(out, "Low Mandatory Level") || integrity != "low" {
+			t.Fatalf("%v: exit %d integrity %s, output %q", level, code, integrity, out)
+		}
 	}
-	_, _, integrity = runSpawn(t, spawnOptions{Exe: whoami, Args: []string{"/groups"}, Dir: os.TempDir()})
-	if integrity == "low" {
-		t.Fatal("normal spawn came out low")
+	for _, level := range []Level{-1, 2, 99} {
+		if p, err := spawn(spawnOptions{Exe: whoami, Dir: os.TempDir(), Level: level}); err == nil {
+			p.Kill()
+			t.Fatalf("level %d started a process at integrity %s", level, p.Integrity())
+		}
 	}
 }
 
@@ -99,7 +103,7 @@ func TestChildEnvIsAnAllowlist(t *testing.T) {
 	}
 }
 
-// Only a failure of the token itself may lead to a start at normal integrity.
+// Only a failure of the token itself counts as the sandbox being unavailable.
 func TestTokenErrors(t *testing.T) {
 	if !tokenError(windows.ERROR_PRIVILEGE_NOT_HELD) || !tokenError(fmt.Errorf("x: %w", windows.ERROR_BAD_TOKEN_TYPE)) {
 		t.Error("a token error was not recognised")
@@ -109,10 +113,10 @@ func TestTokenErrors(t *testing.T) {
 			t.Errorf("%v taken for a token error", err)
 		}
 	}
-	// A real start under the low-integrity token that fails for another reason is no token error.
-	_, err := spawn(spawnOptions{Exe: filepath.Join(t.TempDir(), "absent.exe"), Dir: os.TempDir(), LowIL: true})
-	if err == nil || errors.Is(err, ErrLowILUnavailable) {
-		t.Fatalf("a missing file under low integrity: %v", err)
+	// A real start in the sandbox that fails for another reason is no token error.
+	_, err := spawn(spawnOptions{Exe: filepath.Join(t.TempDir(), "absent.exe"), Dir: os.TempDir()})
+	if err == nil || errors.Is(err, ErrSandboxUnavailable) {
+		t.Fatalf("a missing file in the sandbox: %v", err)
 	}
 }
 

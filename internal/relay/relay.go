@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
+	"github.com/cheetahrunout/cr-agent/internal/supervisor"
 )
 
 // Limits of ruling B7 and §10.1.
@@ -70,7 +71,7 @@ func New(target Target, log *slog.Logger) *Relay {
 	}
 	return &Relay{
 		Target: target,
-		Client: &http.Client{Transport: &http.Transport{Proxy: nil, DisableCompression: true, MaxIdleConns: 4, IdleConnTimeout: 30 * time.Second}},
+		Client: &http.Client{Transport: &http.Transport{Proxy: nil, DisableCompression: true, MaxIdleConns: 4, IdleConnTimeout: 30 * time.Second, DialContext: supervisor.DialEngine}},
 		Log:    log,
 	}
 }

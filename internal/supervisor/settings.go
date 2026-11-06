@@ -68,7 +68,11 @@ type Launch struct {
 	Port      int
 	APIKey    string
 	Settings  protocol.Settings
+	Socket    string // serve on this Unix socket, not on a port: the sandbox cannot be reached on loopback
 }
+
+// socketOrigin is a CORS origin nothing has: no web page can reach a Unix socket, so none is needed.
+const socketOrigin = "http://cr-engine.invalid"
 
 // BuildArgs returns llama-server's arguments (without argv[0]). Fixed by the agent (§12.3): --jinja,
 // 127.0.0.1, random port, per-launch --api-key, --no-webui, --no-slots, --reasoning-format deepseek,
@@ -79,16 +83,21 @@ func BuildArgs(l Launch) []string {
 	if !s.GPULayers.All {
 		ngl = strconv.Itoa(s.GPULayers.N)
 	}
+	listen, origin := []string{"--host", "127.0.0.1", "--port", strconv.Itoa(l.Port)}, "http://127.0.0.1:"+strconv.Itoa(l.Port)
+	if l.Socket != "" {
+		listen, origin = []string{"--host", l.Socket}, socketOrigin
+	}
 	args := []string{
 		"-m", l.ModelPath,
 		"--alias", l.Alias,
-		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(l.Port),
+	}
+	args = append(args, listen...)
+	args = append(args,
 		"--api-key", l.APIKey,
 		"--jinja",
 		"--no-webui",
 		"--no-slots",
-		"--cors-origins", "http://127.0.0.1:" + strconv.Itoa(l.Port), // only the engine's own origin: no web page may call it
+		"--cors-origins", origin, // only the engine's own origin: no web page may call it
 		"--no-cors-credentials",
 		"--reasoning-format", "deepseek",
 		"--fit", "off",
@@ -99,7 +108,7 @@ func BuildArgs(l Launch) []string {
 		"-ctv", s.KVType,
 		"-fa", s.FlashAttn,
 		"-np", "1",
-	}
+	)
 	if s.NCPUMoE != nil && *s.NCPUMoE > 0 {
 		args = append(args, "--n-cpu-moe", strconv.Itoa(*s.NCPUMoE))
 	}

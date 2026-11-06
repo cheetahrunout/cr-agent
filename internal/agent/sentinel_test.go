@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -56,10 +58,28 @@ func TestSentinelNotInAgentLog(t *testing.T) {
 	trap := sentinel + " CUDA ggml_cuda out of memory failed to load error loading model unable to load " +
 		"offloaded 1/1 layers to GPU server_run_i: model loaded listening on http://127.0.0.1:1234"
 
+	// The sandbox reads only a folder it was granted, and this test changes no permissions on the real model.
+	folder := t.TempDir()
+	copied := filepath.Join(folder, filepath.Base(model))
+	in, err := os.Open(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.Create(copied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatal(err)
+	}
+	out.Close()
+	model = copied
+
 	logs := &syncBuffer{}
 	log := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cfg := Config{Version: "0.1.0", LlamaTag: "test", LogicalCores: 64, Log: log, EngineDir: engineDir,
-		LocalModelID: "sentinel-model", LocalModelPath: model, LowIL: true}
+		LocalModelID: "sentinel-model", LocalModelPath: model, ModelGrant: func() string { return folder }}
 	requireGPU := os.Getenv("CRAGENT_REQUIRE_GPU") != "" // the smoke test on the NVIDIA PC
 	if requireGPU {
 		cfg.GPUInUse = func(ctx context.Context, pid uint32) (bool, error) {

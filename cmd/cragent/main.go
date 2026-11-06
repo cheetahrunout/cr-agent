@@ -88,14 +88,13 @@ func debugOnlyFlags(o options) []string {
 	add(o.model != "", "--model")
 	add(o.modelID != "", "--model-id")
 	add(o.load, "--load")
-	add(!o.lowIL, "--low-il=false")
 	add(o.noMemCap, "--no-mem-cap")
 	return set
 }
 
 type options struct {
 	home, hub, key, engine, model, modelID, modelsDir, pair, hfBase, approve, releaseBase string
-	load, lowIL, noMemCap, noTray, unpair, verbose                                        bool
+	load, noMemCap, noTray, unpair, verbose                                               bool
 }
 
 func parseFlags() options {
@@ -106,7 +105,6 @@ func parseFlags() options {
 	flag.BoolVar(&o.unpair, "unpair", false, "forget this PC's machine key and exit")
 	flag.StringVar(&o.engine, "engine", devEnv("CRAGENT_ENGINE"), "debug builds only: folder with llama-server.exe")
 	flag.StringVar(&o.modelsDir, "models-dir", "", "set the model folder (kept in the config)")
-	flag.BoolVar(&o.lowIL, "low-il", true, "debug builds only can turn this off: start the engine with a low-integrity token")
 	flag.BoolVar(&o.noMemCap, "no-mem-cap", false, "debug builds only: do not cap the engine's job memory at RAM - 4 GiB")
 	flag.BoolVar(&o.noTray, "no-tray", false, "run as a console program without the tray icon")
 	flag.BoolVar(&o.verbose, "v", false, "debug logging")
@@ -478,7 +476,7 @@ func (ap *app) start() error {
 	}
 
 	cfg := agent.Config{
-		Version: version, LlamaTag: llamaTag, SupportedArchs: enginelock.Pinned().Archs(), EngineDir: o.engine, LowIL: o.lowIL, MemLimit: memCap, LogicalCores: sys.Logical,
+		Version: version, LlamaTag: llamaTag, SupportedArchs: enginelock.Pinned().Archs(), EngineDir: o.engine, ModelGrant: ap.modelGrant, MemLimit: memCap, LogicalCores: sys.Logical,
 		Log: log, Models: ap.mm, Store: st,
 		Hardware: func(ctx context.Context) protocol.Hardware {
 			h, err := hw.Report(ctx, ap.mm.Dir())
@@ -578,7 +576,7 @@ func (ap *app) start() error {
 	}
 
 	log.Info("cragent starting", "version", version, "llama_tag", llamaTag, "home", st.Dir(), "models_dir", ap.mm.Dir(),
-		"low_il", o.lowIL, "mem_cap_mb", memCap>>20, "paired", st.Paired(), "debug_build", debugBuild)
+		"isolation", ap.a.Level().String(), "mem_cap_mb", memCap>>20, "paired", st.Paired(), "debug_build", debugBuild)
 
 	switch {
 	case o.key != "":
@@ -632,7 +630,7 @@ func (ap *app) trayState() tray.State {
 	in := ap.a.Snapshot(paired)
 	text, icon := status.Line(in)
 	s := tray.State{Status: text, Icon: icon, Paired: paired, Paused: in.Paused, ModelsDir: ap.mm.Dir(), Version: version,
-		UpdateAvailable: ap.available.Load(), SandboxBlocked: ap.a.SandboxBlocked(), SandboxOff: ap.a.NormalIntegrity()}
+		UpdateAvailable: ap.available.Load(), SandboxBlocked: ap.a.SandboxBlocked(), LowIntegrity: ap.a.Level() == supervisor.LevelLowIntegrity}
 	if ap.q != nil {
 		s.Pending = ap.q.Pending()
 	}
@@ -726,7 +724,7 @@ func (ap *app) onAction(a tray.Action, arg string) {
 		_ = ui.Open(ap.st.LogPath())
 	case tray.ActAbout:
 		c := ap.st.Config()
-		text := "CR Agent " + version + "\nllama.cpp " + llamaTag
+		text := "CR Agent " + version + "\nllama.cpp " + llamaTag + "\n" + isolationText(ap.a.Level())
 		for _, k := range trust.Keys() {
 			text += "\nRelease key id: " + k.ID.String()
 		}
@@ -761,10 +759,55 @@ func (ap *app) onAction(a tray.Action, arg string) {
 	}
 }
 
+func (ap *app) engineSandboxed() bool { return ap.a.Level() == supervisor.LevelAppContainer }
+
+// isolationText says the engine's true level, for the About window.
+func isolationText(l supervisor.Level) string {
+	if l == supervisor.LevelAppContainer {
+		return "Engine isolation: AppContainer"
+	}
+	return "Engine isolation: low integrity, your choice on this PC. The engine can read your files."
+}
+
+// lowIntegrityQuestion says plainly what the opt-in gives up.
+func lowIntegrityQuestion() string {
+	return "The engine's sandbox does not work on this PC.\n\n" +
+		"At low integrity the engine still cannot change your files. But a malicious model that attacks the engine could read your files, " +
+		"including the keys CR Agent keeps on this PC, and could connect to the internet.\n\n" +
+		"Allow this only if you trust the models you load.\n\nRun the engine at low integrity on this PC?"
+}
+
+// modelGrant is the model folder the agent may let the sandbox read at a load: its own, or the one the
+// host allowed by a click in this agent. It changes the permissions of no other folder.
+func (ap *app) modelGrant() string {
+	dir := ap.mm.Dir()
+	if underFolder(dir, ap.st.Dir()) || strings.EqualFold(ap.st.Config().EngineReadFolder, dir) {
+		return dir
+	}
+	return ""
+}
+
+// underFolder reports whether dir is parent or below it.
+func underFolder(dir, parent string) bool {
+	rel, err := filepath.Rel(parent, dir)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func modelFolderQuestion(dir string) string {
+	return "The engine runs in a sandbox that cannot read this folder unless you allow it:\n" + dir +
+		"\n\nAllowing adds one read-only permission to the folder, for sandboxed programs on this PC, the engine among them. Your other programs gain nothing." +
+		"\n\nAllow only a folder that holds nothing but models: a model that attacks the engine could read what is in it."
+}
+
 // noticeModelFiles says, once at start and passively, that the model folder holds files the host could
 // add. It offers no button and starts nothing: the tray's Add model files… is the only way in.
 func (ap *app) noticeModelFiles() {
 	if ap.mm == nil {
+		return
+	}
+	// An earlier version had no sandbox to ask for: a folder the host chose then needs this one click.
+	if ap.engineSandboxed() && ap.modelGrant() == "" && !supervisor.CanEngineRead(ap.mm.Dir()) {
+		ap.tr.Notify("The engine cannot read your model folder", "Choose Model folder in the tray menu and pick it again to allow this.")
 		return
 	}
 	s := ap.mm.Scan()
@@ -820,19 +863,21 @@ func importAndTell(ctx context.Context, mm *models.Manager, picks []models.Found
 // toggleSandbox is the host's own choice, on this PC, about running the engine outside its
 // low-integrity sandbox when CUDA does not work inside it. Nothing from the hub leads here.
 func (ap *app) toggleSandbox() {
-	off := !ap.a.NormalIntegrity()
-	if off && !ui.Confirm("The engine could not use the GPU in its low-integrity sandbox on this PC.\n\n"+
-		"Without the sandbox, a malicious model that attacks the engine could change your files, not only read them. "+
-		"Allow this only if you trust the models you load.\n\nRun the engine without the sandbox on this PC?", "Run without") {
+	low := ap.a.Level() == supervisor.LevelAppContainer
+	if low && !ui.Confirm(lowIntegrityQuestion(), "Use low integrity") {
 		return
 	}
-	if err := ap.st.Update(func(c *store.Config) { c.EngineNormalIntegrity = off }); err != nil {
+	if err := ap.st.Update(func(c *store.Config) { c.EngineLowIntegrity = low }); err != nil {
 		ui.Error("The choice could not be saved on this PC.")
 		return
 	}
-	ap.a.AllowNormalIntegrity(off)
-	ap.log.Warn("the host changed the engine's sandbox", "normal_integrity", off)
-	ui.Info("This takes effect the next time a model loads.")
+	ap.a.AllowLowIntegrity(low)
+	ap.log.Warn("the host changed the engine's isolation", "isolation", ap.a.Level().String())
+	text := "This takes effect the next time a model loads."
+	if !low && ap.modelGrant() == "" && !supervisor.CanEngineRead(ap.mm.Dir()) {
+		text += "\n\nThe sandbox cannot read your model folder yet: choose Model folder in the tray menu and pick it again to allow this."
+	}
+	ui.Info(text)
 }
 
 func (ap *app) setToken() {
@@ -884,11 +929,30 @@ func (ap *app) setFolder() {
 		ui.Error("A model is loaded. Unload it in the hub (or pause hosting) before changing the model folder.")
 		return
 	}
+	// The engine's sandbox can read a folder only if the folder says so, and this one is the host's.
+	own := underFolder(dir, ap.st.Dir())
+	readable := own || supervisor.CanEngineRead(dir)
+	if !readable && ap.engineSandboxed() {
+		if !ui.Confirm(modelFolderQuestion(dir), "Allow") {
+			return
+		}
+		if err := supervisor.GrantModelFolder(dir); err != nil {
+			ui.Error("The engine cannot be allowed to read that folder: " + err.Error() + ".")
+			return
+		}
+		readable = true
+	}
 	if err := ap.mm.SetDir(dir); err != nil {
 		ui.Error("That folder cannot be used: " + err.Error() + ".")
 		return
 	}
-	if err := ap.st.Update(func(c *store.Config) { c.ModelsDir = ap.mm.Dir() }); err != nil {
+	if err := ap.st.Update(func(c *store.Config) {
+		c.ModelsDir = ap.mm.Dir()
+		c.EngineReadFolder = ""
+		if !own && readable { // never without the host's click: a later load may renew this folder's entry
+			c.EngineReadFolder = ap.mm.Dir()
+		}
+	}); err != nil {
 		ap.log.Warn("model folder not saved", "err", err.Error())
 	}
 	ap.log.Info("model folder changed", "models_dir", ap.mm.Dir())

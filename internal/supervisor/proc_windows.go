@@ -33,7 +33,7 @@ type spawnOptions struct {
 	Exe       string
 	Args      []string
 	Dir       string
-	LowIL     bool   // start with a low-integrity duplicate of our token
+	Level     Level  // how the child is isolated; there is no level below low integrity
 	MemLimit  uint64 // job memory cap in bytes, 0 = none
 	GPUSelect string
 }
@@ -90,7 +90,7 @@ func spawn(o spawnOptions) (*proc, error) {
 		}
 	}()
 
-	attrs, err := windows.NewProcThreadAttributeList(1)
+	attrs, err := windows.NewProcThreadAttributeList(2)
 	if err != nil {
 		return nil, err
 	}
@@ -124,24 +124,39 @@ func spawn(o spawnOptions) (*proc, error) {
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT |
 		windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_DEFAULT_ERROR_MODE)
 
+	var caps securityCapabilities
 	var pi windows.ProcessInformation
-	if o.LowIL {
+	switch o.Level {
+	case LevelAppContainer:
+		sid, err := engineContainer()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrSandboxUnavailable, err)
+		}
+		caps.AppContainerSid = sid // and no capabilities: no network of any kind
+		if err := attrs.Update(procThreadAttributeSecurityCapabilities, unsafe.Pointer(&caps), unsafe.Sizeof(caps)); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrSandboxUnavailable, err)
+		}
+		if err := windows.CreateProcess(exe16, cmd16, nil, nil, true, flags, &env[0], dir16, &si.StartupInfo, &pi); err != nil {
+			if tokenError(err) {
+				return nil, fmt.Errorf("%w: CreateProcess: %v", ErrSandboxUnavailable, err)
+			}
+			return nil, fmt.Errorf("CreateProcess: %w", err)
+		}
+	case LevelLowIntegrity:
 		tok, err := lowIntegrityToken()
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrLowILUnavailable, err)
+			return nil, fmt.Errorf("%w: low integrity: %v", ErrSandboxUnavailable, err)
 		}
 		err = windows.CreateProcessAsUser(tok, exe16, cmd16, nil, nil, true, flags, &env[0], dir16, &si.StartupInfo, &pi)
 		tok.Close()
 		if err != nil {
 			if tokenError(err) {
-				return nil, fmt.Errorf("%w: CreateProcessAsUser: %v", ErrLowILUnavailable, err)
+				return nil, fmt.Errorf("%w: low integrity: CreateProcessAsUser: %v", ErrSandboxUnavailable, err)
 			}
 			return nil, fmt.Errorf("CreateProcessAsUser: %w", err)
 		}
-	} else {
-		if err := windows.CreateProcess(exe16, cmd16, nil, nil, true, flags, &env[0], dir16, &si.StartupInfo, &pi); err != nil {
-			return nil, fmt.Errorf("CreateProcess: %w", err)
-		}
+	default:
+		return nil, fmt.Errorf("unknown isolation level %d", o.Level)
 	}
 	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
 		windows.TerminateProcess(pi.Process, 1)
@@ -212,8 +227,8 @@ func (p *proc) PeakMemory() uint64 {
 	return p.jobPeak()
 }
 
-// tokenError tells a failure of the token from any other: the process was not created because of what
-// the token is or may do, not because of the file, its arguments or the model.
+// tokenError tells a failure of the sandbox's token from any other: the process was not created because
+// of what the token is or may do, not because of the file, its arguments or the model.
 func tokenError(err error) bool {
 	for _, code := range []windows.Errno{
 		windows.ERROR_PRIVILEGE_NOT_HELD, windows.ERROR_NO_TOKEN, windows.ERROR_BAD_TOKEN_TYPE,

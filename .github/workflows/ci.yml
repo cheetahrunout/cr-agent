@@ -49,6 +49,13 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go test -count=1 ./...
+      # What the clipboard test found, or why it skipped, in the log: a green line alone does not say.
+      - name: clipboard result
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 -v -run 'TestSandboxCannotUseTheClipboard' ./internal/supervisor
       - name: go test (debug build)
         shell: bash
         env:

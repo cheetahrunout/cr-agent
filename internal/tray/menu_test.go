@@ -25,7 +25,7 @@ func labels(items []Item) string {
 func TestMenu(t *testing.T) {
 	unpaired := labels(Menu(State{Status: "Not paired", ModelsDir: `D:\Models`, Version: "0.1.0", HFToken: "absent"}))
 	want := "(CR Agent)\n(Not paired)\n---\n(Pause hosting (frees your GPU))\n---\nPair with the hub…\nHugging Face token…   not set\n" +
-		"Model folder…   D:\\Models\nAdd model files…\n---\nOpen hub\nOpen log\nAbout · 0.1.0\nQuit (machine goes offline)\n"
+		"Model folder…   D:\\Models\nAdd model files…\n---\nOpen hub\nOpen log\nWhat's new\nAbout · 0.1.0\nQuit (machine goes offline)\n"
 	if unpaired != want {
 		t.Fatalf("unpaired menu:\n%s\nwant:\n%s", unpaired, want)
 	}

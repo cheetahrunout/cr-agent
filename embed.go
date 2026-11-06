@@ -14,3 +14,8 @@ var EngineLock []byte
 //
 //go:embed supported_archs.txt
 var SupportedArchs string
+
+// Changelog is CHANGELOG.md, which the tray shows under What's new.
+//
+//go:embed CHANGELOG.md
+var Changelog string

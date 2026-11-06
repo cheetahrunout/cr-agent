@@ -30,6 +30,7 @@ const (
 	ActPending       // a pending approval was chosen from the menu; arg is its id
 	ActNotification  // the notification was clicked
 	ActAddModels     // the host wants to add GGUF files from the model folder
+	ActChangelog     // the host wants to see what changed
 )
 
 // Pending is a download waiting for the host's Allow or Deny.
@@ -107,6 +108,7 @@ func Menu(s State) []Item {
 		Item{Separator: true},
 		Item{Label: "Open hub", Action: ActOpenHub},
 		Item{Label: "Open log", Action: ActOpenLog},
+		Item{Label: "What's new", Action: ActChangelog},
 		Item{Label: fmt.Sprintf("About · %s", s.Version), Action: ActAbout},
 		Item{Label: "Quit (machine goes offline)", Action: ActQuit},
 	)

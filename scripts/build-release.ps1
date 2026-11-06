@@ -32,7 +32,12 @@ if ($LASTEXITCODE -ne 0) { throw "protocol\release-keys.json is not fit to ship"
 $work = Join-Path ([IO.Path]::GetTempPath()) ("cr-agent-build-$Version-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 try {
     & (Join-Path $PSScriptRoot "fetch-engine.ps1") -Out (Join-Path $work "engine")
-    $notes = "Built from commit $commit."
+    # What this release changes goes into its signed notes. A release without a section in CHANGELOG.md is not built.
+    $section = [regex]::Match((Get-Content (Join-Path $repo "CHANGELOG.md") -Raw), "(?ms)^## $([regex]::Escape($Version))\s*$(.*?)(?=^## |\z)").Groups[1].Value
+    $changes = @($section -split "\r?\n" | Where-Object { $_ -match '^- ' } | ForEach-Object { $_.Substring(2).Trim() })
+    if ($changes.Count -eq 0 -and -not $RollbackTest) { throw "CHANGELOG.md has no section for $Version. Add one, commit it, and build again." }
+    if (($changes -join ' ') -match '"') { throw "CHANGELOG.md: no double quotes in the section for $Version." }
+    $notes = ("$($changes -join ' ') Built from commit $commit.").Trim()
     $build = @{ Version = $Version; EngineDir = (Join-Path $work "engine"); Out = (Join-Path $work "release"); Notes = $notes }
     if ($RollbackTest) { $build.RollbackTest = $true }
     if ($Iscc) { $build.Iscc = $Iscc }

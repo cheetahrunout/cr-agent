@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	cragentroot "github.com/cheetahrunout/cr-agent"
 	"github.com/cheetahrunout/cr-agent/internal/agent"
 	"github.com/cheetahrunout/cr-agent/internal/approve"
 	"github.com/cheetahrunout/cr-agent/internal/enginelock"
@@ -720,6 +721,14 @@ func (ap *app) onAction(a tray.Action, arg string) {
 		}
 	case tray.ActOpenLog:
 		_ = ui.Open(ap.st.LogPath())
+	case tray.ActChangelog:
+		// A plain file beside the log, so it opens in the host's own text viewer and goes with the logs on uninstall.
+		path := filepath.Join(filepath.Dir(ap.st.LogPath()), "changelog.txt")
+		if err := os.WriteFile(path, []byte(strings.ReplaceAll(cragentroot.Changelog, "\n", "\r\n")), 0o600); err != nil {
+			ui.Error("The list of changes could not be written: " + err.Error())
+			return
+		}
+		_ = ui.Open(path)
 	case tray.ActAbout:
 		c := ap.st.Config()
 		text := "CR Agent " + version + "\nllama.cpp " + llamaTag + "\n" + isolationText(ap.a.Level())

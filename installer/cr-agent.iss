@@ -133,7 +133,34 @@ begin
   Result := Copy(Dir, 1, Length(Parent)) = Parent;
 end;
 
-// True when the folder holds anything. An agent that is already there does not count: that is a reinstall.
+// True when the folder holds nothing but the entries . and ..
+function IsEmptyFolder(Dir: String): Boolean;
+var
+  F: TFindRec;
+begin
+  Result := True;
+  if FindFirst(Dir + '\*', F) then
+  begin
+    try
+      repeat
+        if (F.Name <> '.') and (F.Name <> '..') then
+          Result := False;
+      until (not Result) or not FindNext(F);
+    finally
+      FindClose(F);
+    end;
+  end;
+end;
+
+// The uninstaller leaves the model folder: models are large and the host's own. So <folder>\models, empty or with the
+// agent's own index in it, is what an earlier install left, and installing there again is a reinstall.
+function IsLeftByAnAgent(Dir: String; F: TFindRec): Boolean;
+begin
+  Result := (Lowercase(F.Name) = 'models') and ((F.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0)
+    and (FileExists(Dir + '\models\cr-agent-index.json') or IsEmptyFolder(Dir + '\models'));
+end;
+
+// True when the folder holds anything else. An agent that is already there does not count: that is a reinstall.
 function HoldsOtherFiles(Dir: String): Boolean;
 var
   F: TFindRec;
@@ -145,7 +172,7 @@ begin
   begin
     try
       repeat
-        if (F.Name <> '.') and (F.Name <> '..') then
+        if (F.Name <> '.') and (F.Name <> '..') and not IsLeftByAnAgent(Dir, F) then
           Result := True;
       until Result or not FindNext(F);
     finally

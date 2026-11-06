@@ -14,6 +14,7 @@ type fakeUpdater struct {
 	mu     sync.Mutex
 	err    error
 	called []string
+	local  []string
 }
 
 func (f *fakeUpdater) Update(_ context.Context, version string, progress updater.Progress) error {
@@ -31,6 +32,13 @@ func (f *fakeUpdater) Update(_ context.Context, version string, progress updater
 	progress("installing", 100)
 	progress("restarting", 100)
 	return nil
+}
+
+func (f *fakeUpdater) UpdateLocal(ctx context.Context, version string, progress updater.Progress) error {
+	f.mu.Lock()
+	f.local = append(f.local, version)
+	f.mu.Unlock()
+	return f.Update(ctx, version, progress)
 }
 
 func updateCmd(id, version string) string {
@@ -214,6 +222,12 @@ func TestInstallUpdateFromTheTray(t *testing.T) {
 	h.next("pong", 2*time.Second)
 	if err := w.a.InstallUpdate("0.1.1"); err != nil {
 		t.Fatal(err)
+	}
+	fu.mu.Lock()
+	viaLocal := len(fu.local)
+	fu.mu.Unlock()
+	if viaLocal != 1 {
+		t.Fatal("the tray's install did not use the local path")
 	}
 	select {
 	case <-restarts:

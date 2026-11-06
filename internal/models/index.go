@@ -55,8 +55,12 @@ func (e *Entry) valid() bool {
 			return false
 		}
 	}
-	for _, f := range e.Files {
-		if !protocol.ValidGGUFFile(f.Path) || f.Size <= 0 || !reSHA.MatchString(f.SHA256) {
+	if len(e.Files) != 0 && len(e.Files) != len(e.Names) {
+		return false
+	}
+	for i, f := range e.Files {
+		// Names is what was approved and Files[0] is what loads: they must be the same files.
+		if f.Path != e.Names[i] || !protocol.ValidGGUFFile(f.Path) || f.Size <= 0 || !reSHA.MatchString(f.SHA256) {
 			return false
 		}
 	}

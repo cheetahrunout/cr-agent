@@ -43,3 +43,5 @@ func (p *agentProc) Kill() {
 	p.cmd.Process.Kill()
 	<-p.done
 }
+
+func notify(string) {}

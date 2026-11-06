@@ -51,6 +51,6 @@ func run() int {
 		log.Error("this build cannot run", "err", err.Error())
 		return 2
 	}
-	r := &launch.Runner{Root: root, Keys: trust.Keys(), Args: os.Args[1:], Log: log, Start: startAgent}
+	r := &launch.Runner{Root: root, Keys: trust.Keys(), Args: os.Args[1:], Log: log, Start: startAgent, Notify: notify}
 	return r.Run()
 }

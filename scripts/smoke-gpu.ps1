@@ -1,6 +1,7 @@
-# The GPU smoke test of a locally built release (ruling B62). The lead runs it; never in the session
-# where the passphrase is typed. Also run it at every llama.cpp bump: it includes the sentinel test
-# of ruling B16.
+# The GPU smoke test of a locally built release (ruling B62). The lead runs it, in another terminal,
+# before the owner signs. That is not isolation: it is the same Windows account. What makes it acceptable
+# is the hash pin: the engine is checked against engine.lock first, and the owner checks the signing
+# tool with Get-FileHash. Also run this at every llama.cpp bump: it includes the sentinel test of B16.
 #
 #   pwsh -File scripts\smoke-gpu.ps1 -Dist <release folder>
 #

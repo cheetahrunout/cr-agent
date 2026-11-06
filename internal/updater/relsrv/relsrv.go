@@ -40,6 +40,9 @@ type Server struct {
 	RedirectLatestTo string // redirect the latest path here instead (a host that is not allowed)
 	CutAfter         int64  // cut the first CutTimes archive responses after this many bytes
 	CutTimes         int32
+	StallAfter       int64 // stall the first StallTimes archive responses after this many bytes, connection open
+	StallTimes       int32
+	stalls           atomic.Int32
 	cut              atomic.Int32
 }
 
@@ -172,6 +175,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(path, ".zip") && s.CutAfter > 0 && s.cut.Add(1) <= s.CutTimes {
 		out = &cutter{ResponseWriter: w, limit: s.CutAfter}
 	}
+	if strings.HasSuffix(path, ".zip") && s.StallAfter > 0 && s.stalls.Add(1) <= s.StallTimes {
+		out = &cutter{ResponseWriter: w, limit: s.StallAfter, stall: r.Context().Done()}
+	}
 	http.ServeContent(out, r, "", time.Time{}, f)
 }
 
@@ -179,6 +185,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 type cutter struct {
 	http.ResponseWriter
 	limit, sent int64
+	stall       <-chan struct{} // when set, wait for this instead of closing at the limit
 }
 
 func (c *cutter) Write(p []byte) (int, error) {
@@ -188,6 +195,9 @@ func (c *cutter) Write(p []byte) (int, error) {
 			if f, ok := c.ResponseWriter.(http.Flusher); ok {
 				f.Flush()
 			}
+		}
+		if c.stall != nil {
+			<-c.stall
 		}
 		panic(http.ErrAbortHandler)
 	}

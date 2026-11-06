@@ -32,6 +32,9 @@ func (m *Manager) run(j *job, e *Entry) {
 		out.Err = errf(protocol.ErrCancelled, "the agent is closing")
 	case out.Err == nil:
 		e.State, e.ETags = StateReady, nil
+		if err := m.recordHashes(e); err != nil {
+			m.log.Warn("the hashes of a finished download could not be stored; it will not load", "model_id", e.ModelID, "err", err.Error())
+		}
 	case out.Err.Code == protocol.ErrCancelled:
 		if m.index[e.ModelID] == e {
 			delete(m.index, e.ModelID)
@@ -502,6 +505,59 @@ func (m *Manager) loadApprovals() approvals {
 	}
 	_ = json.Unmarshal(b, &a)
 	return a
+}
+
+// recordHashes keeps the SHA-256 of each finished download in DPAPI state (finding M3). The index sits
+// in the model folder and brings its own hashes, so a planted index would pass a check against itself;
+// this record exists only for what this agent, for this user, downloaded and checked.
+func (m *Manager) recordHashes(e *Entry) error {
+	if m.o.Store == nil {
+		return errors.New("no store")
+	}
+	rec := m.loadHashes()
+	for _, f := range e.Files {
+		rec[hashKey(e, f.Path)] = f.SHA256
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return m.o.Store.WriteSecret(store.SecretModelHashes, b)
+}
+
+func hashKey(e *Entry, file string) string { return e.Repo + "@" + e.Commit + "/" + file }
+
+func (m *Manager) loadHashes() map[string]string {
+	rec := map[string]string{}
+	if m.o.Store == nil {
+		return rec
+	}
+	b, err := m.o.Store.ReadSecret(store.SecretModelHashes)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			m.log.Warn("the model hashes cannot be read; models must be downloaded again", "err", err.Error())
+		}
+		return rec
+	}
+	if json.Unmarshal(b, &rec) != nil {
+		return map[string]string{}
+	}
+	return rec
+}
+
+// recorded reports whether every file of an entry is one this agent downloaded, with the hash the
+// index states.
+func (m *Manager) recorded(e *Entry) bool {
+	if len(e.Files) == 0 {
+		return false
+	}
+	rec := m.loadHashes()
+	for _, f := range e.Files {
+		if rec[hashKey(e, f.Path)] != f.SHA256 {
+			return false
+		}
+	}
+	return true
 }
 
 // approved reports whether the host allowed every one of these files of this commit.

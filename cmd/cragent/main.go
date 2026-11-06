@@ -174,6 +174,10 @@ func run() int {
 	st, err := store.Open(home)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cannot open the agent's folder:", err)
+		// A build without a console has no other way to say this. Nothing retries it: the file stays damaged.
+		if !o.noTray {
+			ui.Error(openFailure(home, err))
+		}
 		return 2
 	}
 	logFile := newLogWriter(st.LogPath())
@@ -228,13 +232,12 @@ func run() int {
 		root: root, managed: managed, quit: make(chan struct{}, 1)}
 	if err := ap.start(); err != nil {
 		log.Error("start failed", "err", err.Error())
-		// Exit 2: the launcher does not restart it. On trial the launcher reverts without any dialog;
-		// otherwise the host must learn why nothing runs (a build without a console has no other way).
 		ptr, perr := layout.ReadPointer(root)
-		if !o.noTray && !(managed && perr == nil && ptr.PendingSince != nil) {
-			ui.Error("CR Agent cannot start: " + err.Error() + ".\n\nIf this keeps happening, uninstall CR Agent and install it again.")
+		text, code := startFailure(err, managed, managed && perr == nil && ptr.PendingSince != nil)
+		if text != "" && !o.noTray {
+			ui.Error(text)
 		}
-		return 2
+		return code
 	}
 	defer ap.stop()
 
@@ -286,6 +289,29 @@ func (b *latestBox) Load() string {
 		return *p
 	}
 	return ""
+}
+
+// startFailure decides what a failed start means to the host. The exit code tells the launcher what
+// to do: 1 is retried a few times, 2 is not. Only release state that cannot be read needs a reinstall:
+// anything else may pass (a model drive that is not connected yet), so the launcher retries, and it
+// tells the host itself if it gives up. A version on trial just fails: the launcher reverts it.
+func startFailure(err error, managed, onTrial bool) (text string, code int) {
+	switch {
+	case onTrial:
+		return "", 1
+	case errors.Is(err, updater.ErrStateUnreadable):
+		return "CR Agent cannot read its release state on this PC, so it cannot tell which versions are safe to run.\n\nUninstall CR Agent and install it again. Your models stay where they are.", 2
+	case managed:
+		return "", 1 // the launcher retries, and tells the host if it gives up
+	default: // no launcher to retry or to tell the host
+		return "CR Agent cannot start: " + err.Error() + ".", 1
+	}
+}
+
+// openFailure is what the host reads when the agent's folder or settings cannot be opened.
+func openFailure(home string, err error) string {
+	return "CR Agent cannot read its settings in " + home + ":\n" + err.Error() +
+		".\n\nIf config.json is damaged, move it out of that folder and start CR Agent again. You may then have to pair this PC again."
 }
 
 // exit ends the agent with an exit code: 75 asks the launcher to start the version its pointer names.

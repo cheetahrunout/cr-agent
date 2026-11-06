@@ -71,3 +71,12 @@ func (p *agentProc) Kill() {
 		windows.CloseHandle(p.job)
 	})
 }
+
+// notify shows the host a plain message box. The launcher stays small: no dialog library.
+func notify(text string) {
+	t, err1 := windows.UTF16PtrFromString(text)
+	c, err2 := windows.UTF16PtrFromString("CR Agent")
+	if err1 == nil && err2 == nil {
+		windows.MessageBox(0, t, c, windows.MB_OK|windows.MB_ICONWARNING)
+	}
+}

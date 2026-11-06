@@ -62,7 +62,10 @@ type Config struct {
 	Start    StartFunc                                           // default: supervisor.Start
 	Hardware func(ctx context.Context) protocol.Hardware         // default: empty report
 	GPUInUse func(ctx context.Context, pid uint32) (bool, error) // nil: skip the CUDA check
-	HFToken  func() string                                       // absent | present | invalid; nil: not reported
+	// ProbeCUDA asks the engine alone, under low integrity, whether it sees a CUDA device. Only its
+	// "no" raises the tray's offer. Default with the real supervisor: supervisor.ProbeCUDA.
+	ProbeCUDA func() (bool, error)
+	HFToken   func() string // absent | present | invalid; nil: not reported
 
 	// OnChange is called when anything the tray shows may have changed. It must not block.
 	OnChange func()
@@ -99,6 +102,8 @@ type Config struct {
 // Updater is the part of internal/updater the agent uses.
 type Updater interface {
 	Update(ctx context.Context, version string, progress updater.Progress) error
+	// UpdateLocal is Update started by the host on the PC: nothing the hub said has a part in it.
+	UpdateLocal(ctx context.Context, version string, progress updater.Progress) error
 }
 
 // Agent implements link.Handler.
@@ -122,8 +127,9 @@ type Agent struct {
 	sleeping          bool
 	config            protocol.ConfigArgs
 	lowILResult       string
-	sandboxBlocked    bool // CUDA failed under low integrity: the tray offers the opt-in
-	normalIntegrityOK bool // the host clicked the opt-in; remembered per PC by the caller
+	testBeforeResolve func() // tests only
+	sandboxBlocked    bool   // CUDA failed under low integrity: the tray offers the opt-in
+	normalIntegrityOK bool   // the host clicked the opt-in; remembered per PC by the caller
 	hubVersion        string
 	update            *protocol.UpdateStatus // set while an update runs or after one failed
 	updating          bool
@@ -148,6 +154,7 @@ func New(cfg Config) *Agent {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
+	realEngine := cfg.Start == nil
 	if cfg.Start == nil {
 		cfg.Start = func(ctx context.Context, c supervisor.Config) (Engine, error) {
 			e, err := supervisor.Start(ctx, c)
@@ -156,6 +163,10 @@ func New(cfg Config) *Agent {
 			}
 			return e, nil
 		}
+	}
+	if cfg.ProbeCUDA == nil && realEngine {
+		dir := cfg.EngineDir
+		cfg.ProbeCUDA = func() (bool, error) { return supervisor.ProbeCUDA(dir) }
 	}
 	if cfg.OnChange == nil {
 		cfg.OnChange = func() {}
@@ -624,7 +635,7 @@ func (a *Agent) cmdUpdate(s *link.Session, id, version string) {
 	a.updating = true
 	a.mu.Unlock()
 	_ = s.Send(&protocol.CmdAck{ID: id})
-	err := a.runUpdate(version)
+	err := a.runUpdate(version, false)
 	var ue *updater.Error
 	switch {
 	case err == nil:
@@ -660,7 +671,7 @@ func (a *Agent) InstallUpdate(version string) error {
 	}
 	a.updating = true
 	a.mu.Unlock()
-	err := a.runUpdate(version)
+	err := a.runUpdate(version, true)
 	if errors.Is(err, updater.ErrAlreadyInstalled) {
 		a.sendStatus(false)
 		return nil
@@ -678,7 +689,7 @@ func (a *Agent) InstallUpdate(version string) error {
 }
 
 // runUpdate runs the updater with progress as status frames. The caller set a.updating.
-func (a *Agent) runUpdate(version string) error {
+func (a *Agent) runUpdate(version string, local bool) error {
 	lastState, lastPct := "", -1.0
 	progress := func(state string, pct float64) {
 		whole := float64(int(pct))
@@ -692,7 +703,11 @@ func (a *Agent) runUpdate(version string) error {
 		a.sendStatus(false)
 	}
 	// The update goes on if the socket drops: it is the agent's own job, like a download.
-	err := a.cfg.Updater.Update(context.Background(), version, progress)
+	run := a.cfg.Updater.Update
+	if local {
+		run = a.cfg.Updater.UpdateLocal
+	}
+	err := run(context.Background(), version, progress)
 	a.mu.Lock()
 	a.updating = false
 	switch {
@@ -725,6 +740,13 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		a.cmdErr(s, id, protocol.ErrBusy, "", "the host paused this PC")
 		return
 	}
+	// Held from here, through the first load's hash: a slow hash must not finish after a later load
+	// and replace the model that one loaded.
+	if !a.beginLoad() {
+		a.cmdErr(s, id, protocol.ErrBusy, "", "a load is already running")
+		return
+	}
+	defer a.endLoad()
 	lim := supervisor.Limits{LogicalCores: a.cfg.LogicalCores}
 	// Settings are judged against the machine's bounds first, so a bad value is named even for an unknown model.
 	if fe := supervisor.CheckSettings(args.Settings, lim); fe != nil {
@@ -738,6 +760,9 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 	case a.cfg.LocalModelID != "" && args.ModelID == a.cfg.LocalModelID:
 		path = a.cfg.LocalModelPath
 	case a.cfg.Models != nil:
+		if a.testBeforeResolve != nil {
+			a.testBeforeResolve()
+		}
 		l, lerr := a.cfg.Models.Resolve(args.ModelID)
 		if lerr != nil {
 			a.modelErr(s, id, lerr)
@@ -757,7 +782,7 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		a.cmdErr(s, id, protocol.ErrNotFound, "model_id", "model not on this PC")
 		return
 	}
-	res, err := a.Load(s.Context(), args.ModelID, path, args.Settings)
+	res, err := a.loadHeld(s.Context(), args.ModelID, path, args.Settings)
 	if err != nil {
 		code := protocol.ErrEngineFailed
 		if errors.Is(err, errBusy) {
@@ -765,7 +790,7 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		}
 		msg := "engine did not start"
 		if errors.Is(err, errNoCUDAUnderLowIL) {
-			msg = EngineNoCUDALowIL + ": the engine cannot use the GPU in its sandbox on this PC; only the host can change that, on the PC"
+			msg = EngineNoCUDALowIL + ": the engine got no GPU in its sandbox with these settings"
 		}
 		a.cmdErr(s, id, code, "", msg)
 		return
@@ -814,20 +839,40 @@ var errBusy = errors.New("a load is already running, or the PC is paused or asle
 
 // Load (re)starts the engine on a model file with the given settings. ctx bounds the wait for /health.
 func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Settings) (map[string]any, error) {
+	if !a.beginLoad() {
+		return nil, errBusy
+	}
+	defer a.endLoad()
+	return a.loadHeld(ctx, modelID, path, st)
+}
+
+// beginLoad takes the one load slot; false when a load is running or the PC is paused or asleep.
+func (a *Agent) beginLoad() bool {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.loading || a.paused || a.sleeping {
+		return false
+	}
+	a.loading = true
+	return true
+}
+
+func (a *Agent) endLoad() {
+	a.mu.Lock()
+	a.loading = false
+	a.mu.Unlock()
+}
+
+// loadHeld is Load for a caller that holds the load slot.
+func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.Settings) (map[string]any, error) {
+	a.mu.Lock()
+	if a.paused || a.sleeping { // paused or put to sleep during the first load's hash
 		a.mu.Unlock()
 		return nil, errBusy
 	}
-	a.loading = true
 	old := a.engine
 	a.engine, a.state, a.settings, a.engineErr, a.loadedID = nil, protocol.EngineLoading, &st, "", modelID
 	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.loading = false
-		a.mu.Unlock()
-	}()
 	a.sendStatus(false)
 	if old != nil {
 		a.stopEngine(old)
@@ -880,9 +925,16 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 				a.setLowIL("failed: the engine holds no CUDA context under low integrity")
 				eng.Stop()
 				eng, err, failure = nil, errNoCUDAUnderLowIL, EngineNoCUDALowIL
-				a.mu.Lock()
-				a.sandboxBlocked = true
-				a.mu.Unlock()
+				// This load's settings came from the hub and can fail on purpose (a gpu_select of a GPU the
+				// PC does not have). Only the agent's own probe may raise the offer to leave the sandbox.
+				if a.cfg.ProbeCUDA != nil {
+					found, perr := a.cfg.ProbeCUDA()
+					blocked := perr == nil && !found
+					a.log.Info("CUDA probe under low integrity", "device_found", found, "probe_failed", perr != nil)
+					a.mu.Lock()
+					a.sandboxBlocked = blocked
+					a.mu.Unlock()
+				}
 			default:
 				a.setLowIL("ok: CUDA context present under low integrity")
 			}
@@ -908,6 +960,9 @@ func (a *Agent) Load(ctx context.Context, modelID, path string, st protocol.Sett
 	}
 	a.engine, a.state = eng, protocol.EngineLoaded
 	a.lastActivity, a.lastOnline = time.Now(), time.Now() // both idle clocks start at the load
+	if lowIL {
+		a.sandboxBlocked = false // the sandbox just worked
+	}
 	a.mu.Unlock()
 	res := map[string]any{"start_ms": ms, "low_il": lowIL}
 	if a.cfg.GPUInUse != nil && wantGPU {

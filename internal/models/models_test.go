@@ -838,3 +838,119 @@ func TestIndexAloneGrantsNothing(t *testing.T) {
 		t.Fatal(lerr)
 	}
 }
+
+// Finding M3 gap: a planted index brings its own hash, so the check must be against this agent's own
+// record. An allowlisted publisher's name changes nothing.
+func TestPlantedIndexForAnAllowlistedPublisher(t *testing.T) {
+	e := newEnv(t)
+	evil := append([]byte(nil), e.model...)
+	evil[len(evil)-1] ^= 0xff
+	other := filepath.Join(t.TempDir(), "folder")
+	file := filepath.Join(other, "unsloth", "Tiny-GGUF", commitA[:12], "Tiny-Q4_K_M.gguf")
+	os.MkdirAll(filepath.Dir(file), 0o755)
+	os.WriteFile(file, evil, 0o644)
+	idx := indexFile{Version: 1, Models: []*Entry{{ModelID: "planted", Repo: "unsloth/Tiny-GGUF", Commit: commitA, Kind: "gguf", Names: []string{"Tiny-Q4_K_M.gguf"},
+		Files: []protocol.LocalFile{{Path: "Tiny-Q4_K_M.gguf", Size: int64(len(evil)), SHA256: hftest.SHA256(evil)}}, State: StateReady}}}
+	j, _ := json.Marshal(idx)
+	os.WriteFile(filepath.Join(other, indexName), j, 0o644)
+	if err := e.m.SetDir(other); err != nil {
+		t.Fatal(err)
+	}
+	if _, lerr := e.m.Resolve("planted"); lerr == nil || lerr.Code != protocol.ErrDenied {
+		t.Fatalf("a planted index for an allowlisted publisher: %v", lerr)
+	}
+	// A real download of those same names, with the index then changed to state the planted hash, is refused too.
+	if err := e.m.SetDir(filepath.Join(t.TempDir(), "clean")); err != nil {
+		t.Fatal(err)
+	}
+	if o := e.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	if _, lerr := e.m.Resolve("tiny"); lerr != nil {
+		t.Fatal(lerr)
+	}
+	e.m.mu.Lock()
+	e.m.index["tiny"].Files[0].SHA256 = hftest.SHA256(evil)
+	e.m.mu.Unlock()
+	if _, lerr := e.m.Resolve("tiny"); lerr == nil || lerr.Code != protocol.ErrDenied {
+		t.Fatalf("an index that disagrees with the record: %v", lerr)
+	}
+	// A download of a model with no record yet is not answered "already there": it goes through the
+	// lookup, finds the file by its hash, and records it, with nothing fetched.
+	e2 := newEnv(t)
+	if o := e2.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	e2.st.DeleteSecret(store.SecretModelHashes)
+	before := e2.srv.BlobRequests.Load()
+	if _, lerr := e2.m.Resolve("tiny"); lerr == nil {
+		t.Fatal("loaded without a record")
+	}
+	if o := e2.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil || e2.srv.BlobRequests.Load() != before {
+		t.Fatalf("download again: %v", o.Err)
+	}
+	if _, lerr := e2.m.Resolve("tiny"); lerr != nil {
+		t.Fatal(lerr)
+	}
+}
+
+// Finding M3 gap: Names is what was approved, Files is what loads. An index must not split them.
+func TestIndexNamesAndFilesAreOneList(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	entry := func(names []string, files ...string) *Entry {
+		e := &Entry{ModelID: "m", Repo: "wizard-org/App-GGUF", Commit: commitA, Kind: "gguf", Names: names, State: StateReady}
+		for _, f := range files {
+			e.Files = append(e.Files, protocol.LocalFile{Path: f, Size: 1, SHA256: sha})
+		}
+		return e
+	}
+	if !entry([]string{"a.gguf", "b.gguf"}, "a.gguf", "b.gguf").valid() {
+		t.Fatal("a good entry was refused")
+	}
+	for name, e := range map[string]*Entry{
+		"another file":   entry([]string{"benign.gguf"}, "evil.gguf"),
+		"another order":  entry([]string{"a.gguf", "b.gguf"}, "b.gguf", "a.gguf"),
+		"an extra file":  entry([]string{"a.gguf"}, "a.gguf", "b.gguf"),
+		"a missing file": entry([]string{"a.gguf", "b.gguf"}, "a.gguf"),
+	} {
+		if e.valid() {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// Finding: the cache key includes size and modified time, and one hash runs at a time per file.
+func TestHashCacheKey(t *testing.T) {
+	e := newEnv(t)
+	if o := e.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	var hashes atomic.Int32
+	e.m.testBeforeHash = func() {
+		hashes.Add(1)
+		time.Sleep(100 * time.Millisecond) // long enough for all four to arrive
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, lerr := e.m.Resolve("tiny"); lerr != nil {
+				t.Error(lerr)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := hashes.Load(); n != 1 {
+		t.Fatalf("%d hashes of one file", n)
+	}
+	// Changed with the size kept, while this process runs: the modified time gives it away.
+	p := tinyPath(e.root)
+	b, _ := os.ReadFile(p)
+	b[len(b)-1] ^= 0xff
+	os.WriteFile(p, b, 0o644)
+	os.Chtimes(p, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+	if _, lerr := e.m.Resolve("tiny"); lerr == nil || lerr.Code != protocol.ErrHashMismatch {
+		t.Fatalf("a file changed after its first load: %v", lerr)
+	}
+}

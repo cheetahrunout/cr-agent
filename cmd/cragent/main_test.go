@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
+	"github.com/cheetahrunout/cr-agent/internal/updater"
 )
 
 // The rollback test's switch names one version: any other value, or the same link flag on another
@@ -147,5 +150,30 @@ func TestLatestDelay(t *testing.T) {
 	}
 	if d := latestDelay(int64(30 * time.Minute)); d != 24*time.Hour+30*time.Minute {
 		t.Fatal(d)
+	}
+}
+
+func TestStartFailure(t *testing.T) {
+	passing := errors.New("model folder: the folder cannot be created")
+	state := fmt.Errorf("install check: %w: damaged", updater.ErrStateUnreadable)
+	for _, c := range []struct {
+		name             string
+		err              error
+		managed, onTrial bool
+		dialog, advice   bool
+		code             int
+	}{
+		{"a missing model drive", passing, true, false, false, false, 1},
+		{"unreadable release state", state, true, false, true, true, 2},
+		{"on trial, whatever the reason", state, true, true, false, false, 1},
+		{"no launcher to retry", passing, false, false, true, false, 1},
+	} {
+		text, code := startFailure(c.err, c.managed, c.onTrial)
+		if code != c.code || (text != "") != c.dialog || strings.Contains(strings.ToLower(text), "install") != c.advice {
+			t.Errorf("%s: code %d, text %q", c.name, code, text)
+		}
+	}
+	if text := openFailure(`C:\x`, errors.New("config.json is damaged")); !strings.Contains(text, "config.json") || strings.Contains(strings.ToLower(text), "install") {
+		t.Errorf("open failure %q", text)
 	}
 }

@@ -137,16 +137,18 @@ type Manager struct {
 	o   Options
 	log *slog.Logger
 
-	mu      sync.Mutex
-	dir     string
-	index   map[string]*Entry
-	jobs    map[string]*job
-	paused  bool
-	wake    chan struct{} // closed and replaced when paused changes
-	slot    chan struct{} // one download at a time
-	inspect sync.Mutex
-	recent  []time.Time     // inspect starts in the last minute
-	hashed  map[string]bool // files whose SHA-256 this process has checked, by path and hash
+	mu             sync.Mutex
+	dir            string
+	index          map[string]*Entry
+	jobs           map[string]*job
+	paused         bool
+	wake           chan struct{} // closed and replaced when paused changes
+	slot           chan struct{} // one download at a time
+	inspect        sync.Mutex
+	recent         []time.Time            // inspect starts in the last minute
+	hashed         map[string]bool        // files whose SHA-256 this process has checked, by path, hash, size and modified time
+	hashLocks      map[string]*sync.Mutex // one hash at a time per file
+	testBeforeHash func()                 // tests only
 }
 
 var (
@@ -196,7 +198,7 @@ func New(o Options) (*Manager, error) {
 	if o.OnChange == nil {
 		o.OnChange = func(bool) {}
 	}
-	m := &Manager{o: o, log: o.Log, hashed: map[string]bool{}, jobs: map[string]*job{}, wake: make(chan struct{}), slot: make(chan struct{}, 1)}
+	m := &Manager{o: o, log: o.Log, hashed: map[string]bool{}, hashLocks: map[string]*sync.Mutex{}, jobs: map[string]*job{}, wake: make(chan struct{}), slot: make(chan struct{}, 1)}
 	if err := m.open(o.Dir); err != nil {
 		return nil, err
 	}
@@ -362,7 +364,7 @@ func (m *Manager) Download(a *protocol.DownloadArgs, onDone func(Outcome)) {
 			onDone(Outcome{Err: &Error{Code: protocol.ErrBadArgs, Field: "model_id", Message: "this model id belongs to another repo"}})
 			return
 		}
-		if sameRequest(e, a) && e.State == StateReady && m.trusted(e) {
+		if sameRequest(e, a) && e.State == StateReady && m.trusted(e) && m.recorded(e) {
 			res := resultOf(e)
 			m.mu.Unlock()
 			onDone(Outcome{Result: res})
@@ -535,6 +537,10 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 		m.log.Warn("load refused: neither an allowlisted publisher nor a stored approval", "model_id", modelID)
 		return nil, errf(protocol.ErrDenied, "this PC's host did not allow this model; download it again to be asked")
 	}
+	if !m.recorded(e) {
+		m.log.Warn("load refused: this agent has no record of downloading this model", "model_id", modelID)
+		return nil, errf(protocol.ErrDenied, "this PC has no record of downloading this model; download it again")
+	}
 	if err := noReparse(dir, filepath.Dir(path)); err != nil {
 		return nil, errf(protocol.ErrEngineFailed, "%v", err)
 	}
@@ -558,31 +564,57 @@ func (m *Manager) Resolve(modelID string) (*Loadable, *Error) {
 func (m *Manager) checkHashes(e *Entry, dir string, files []protocol.LocalFile) *Error {
 	for _, f := range files {
 		path := e.path(dir, f.Path)
-		key := path + "|" + f.SHA256
+		// One hash at a time per file: a second load of it waits and then finds the result.
+		m.mu.Lock()
+		lock := m.hashLocks[path]
+		if lock == nil {
+			lock = &sync.Mutex{}
+			m.hashLocks[path] = lock
+		}
+		m.mu.Unlock()
+		lock.Lock()
+		herr := m.checkHash(e, path, f)
+		lock.Unlock()
+		if herr != nil {
+			return herr
+		}
+	}
+	return nil
+}
+
+// checkHash hashes one file unless this process already did, for this size and modified time.
+func (m *Manager) checkHash(e *Entry, path string, f protocol.LocalFile) *Error {
+	st, serr := os.Stat(path)
+	key := ""
+	if serr == nil {
+		key = fmt.Sprintf("%s|%s|%d|%d", path, f.SHA256, st.Size(), st.ModTime().UnixNano())
 		m.mu.Lock()
 		done := m.hashed[key]
 		m.mu.Unlock()
 		if done {
-			continue
+			return nil
 		}
-		t0 := time.Now()
-		sum, err := hashFile(context.Background(), path)
-		if err != nil || sum != f.SHA256 {
-			m.mu.Lock()
-			if m.index[e.ModelID] == e {
-				e.State = StateError
-				m.saveLocked()
-			}
-			m.mu.Unlock()
-			m.log.Error("load refused: a model file changed since it was downloaded", "model_id", e.ModelID)
-			m.o.OnChange(true)
-			return errf(protocol.ErrHashMismatch, "a model file does not match its SHA-256; download it again")
-		}
-		m.log.Info("model file hashed before its first load", "model_id", e.ModelID, "ms", time.Since(t0).Milliseconds())
-		m.mu.Lock()
-		m.hashed[key] = true
-		m.mu.Unlock()
 	}
+	if m.testBeforeHash != nil {
+		m.testBeforeHash()
+	}
+	t0 := time.Now()
+	sum, err := hashFile(context.Background(), path)
+	if serr != nil || err != nil || sum != f.SHA256 {
+		m.mu.Lock()
+		if m.index[e.ModelID] == e {
+			e.State = StateError
+			m.saveLocked()
+		}
+		m.mu.Unlock()
+		m.log.Error("load refused: a model file changed since it was downloaded", "model_id", e.ModelID)
+		m.o.OnChange(true)
+		return errf(protocol.ErrHashMismatch, "a model file does not match its SHA-256; download it again")
+	}
+	m.log.Info("model file hashed before its first load", "model_id", e.ModelID, "ms", time.Since(t0).Milliseconds())
+	m.mu.Lock()
+	m.hashed[key] = true
+	m.mu.Unlock()
 	return nil
 }
 

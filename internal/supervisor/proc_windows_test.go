@@ -115,3 +115,25 @@ func TestTokenErrors(t *testing.T) {
 		t.Fatalf("a missing file under low integrity: %v", err)
 	}
 }
+
+// ProbeCUDA on the real engine, under the real low-integrity token.
+func TestProbeCUDA(t *testing.T) {
+	dir := os.Getenv("CRAGENT_ENGINE_DIR")
+	if dir == "" {
+		t.Skip("CRAGENT_ENGINE_DIR not set")
+	}
+	found, err := ProbeCUDA(dir)
+	if err != nil || !found {
+		t.Fatalf("found %v err %v", found, err)
+	}
+	if _, err := ProbeCUDA(t.TempDir()); err == nil {
+		t.Fatal("a folder without an engine gave an answer")
+	}
+}
+
+func TestCUDADevicePattern(t *testing.T) {
+	yes := "Available devices:\n  CUDA0: NVIDIA GeForce RTX 5090 (32606 MiB, 30991 MiB free)\n"
+	if !reCUDADevice.MatchString(yes) || reCUDADevice.MatchString("Available devices:\n") || reCUDADevice.MatchString("load_backend: no CUDA0: found\n") {
+		t.Fatal("the device pattern is wrong")
+	}
+}

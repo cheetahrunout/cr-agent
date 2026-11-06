@@ -49,7 +49,8 @@ func TestCrashUnderLowILIsNeverRetriedOutside(t *testing.T) {
 func TestNoCUDAIsAnErrorUntilTheHostOptsIn(t *testing.T) {
 	var runs []bool
 	a := New(Config{Version: "0.1.0", LowIL: true,
-		GPUInUse: func(context.Context, uint32) (bool, error) { return false, nil },
+		GPUInUse:  func(context.Context, uint32) (bool, error) { return false, nil },
+		ProbeCUDA: func() (bool, error) { return false, nil }, // the engine alone sees no device: it is real
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
 			runs = append(runs, c.LowIL)
 			return &bareEngine{done: make(chan struct{})}, nil
@@ -185,4 +186,69 @@ func TestNoCUDACodeReachesTheHub(t *testing.T) {
 	if len(w.started) != 1 || !w.started[0].LowIL {
 		t.Fatalf("starts: %d", len(w.started))
 	}
+}
+
+// A hub can make one load fail its CUDA check (a gpu_select of a GPU the PC does not have). That must
+// not raise the offer to leave the sandbox: the agent's own probe, with no hub input, still sees a device.
+func TestHubCannotRaiseTheOffer(t *testing.T) {
+	probes := 0
+	gpuOK := false
+	a := New(Config{Version: "0.1.0", LowIL: true,
+		GPUInUse:  func(context.Context, uint32) (bool, error) { return gpuOK, nil },
+		ProbeCUDA: func() (bool, error) { probes++; return true, nil },
+		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			return &bareEngine{done: make(chan struct{})}, nil
+		}})
+	defer a.Shutdown()
+	s := "7"
+	a.mu.Lock()
+	a.config.GPUSelect = &s
+	a.mu.Unlock()
+	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(1)); !errors.Is(err, errNoCUDAUnderLowIL) {
+		t.Fatal(err)
+	}
+	if a.SandboxBlocked() || probes != 1 {
+		t.Fatalf("offer raised %v, probes %d", a.SandboxBlocked(), probes)
+	}
+	// A probe that fails is no evidence either, and without a probe nothing is offered.
+	a.cfg.ProbeCUDA = func() (bool, error) { return false, errors.New("no answer") }
+	a.Load(context.Background(), "m", "x.gguf", sandboxSettings(1))
+	if a.SandboxBlocked() {
+		t.Fatal("offered on a failed probe")
+	}
+	// A real "no" raises it; any good load under low integrity clears it.
+	a.cfg.ProbeCUDA = func() (bool, error) { return false, nil }
+	a.Load(context.Background(), "m", "x.gguf", sandboxSettings(1))
+	if !a.SandboxBlocked() {
+		t.Fatal("not offered on a real no")
+	}
+	gpuOK = true
+	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(1)); err != nil {
+		t.Fatal(err)
+	}
+	if a.SandboxBlocked() {
+		t.Fatal("the offer stayed after a good load in the sandbox")
+	}
+}
+
+// A late first-load hash cannot replace a model a later load brought: the slot is held from the start.
+func TestLoadSlotIsHeldFromTheStart(t *testing.T) {
+	w := newWorld(t)
+	h, _ := w.connect()
+	h.send(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T3","op":"download","args":{"model_id":"tiny-q4_k_m","repo":"unsloth/Tiny-GGUF","commit":"` + commitA + `","files":["Tiny-Q4_K_M.gguf"],"kind":"gguf"}}`)
+	h.until("download", 15*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.done" })
+	hashing, release := make(chan struct{}), make(chan struct{})
+	w.a.testBeforeResolve = func() { close(hashing); <-release }
+	load := func(id string) string {
+		return `{"v":1,"t":"cmd","id":"` + id + `","op":"load","args":{"model_id":"tiny-q4_k_m","settings":{"ctx":4096,"gpu_layers":"all","threads":4,"kv_type":"f16","flash_attn":"on"}}}`
+	}
+	h.send(load("c-01JCKZ3Q9X8YB7N6M5P4R3S2T4"))
+	<-hashing
+	h.send(load("c-01JCKZ3Q9X8YB7N6M5P4R3S2T5"))
+	e := h.until("the second load's answer", 5*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.err" })
+	if e["code"] != "busy" || e["id"] != "c-01JCKZ3Q9X8YB7N6M5P4R3S2T5" {
+		t.Fatalf("second load during the first's hash: %v", e)
+	}
+	close(release)
+	h.until("the first load", 5*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.done" && m["id"] == "c-01JCKZ3Q9X8YB7N6M5P4R3S2T4" })
 }

@@ -288,15 +288,16 @@ func cmdSign(args []string) error {
 	return nil
 }
 
-// printSelf shows this program's own SHA-256 before anything is typed into it, to compare with the
-// value written beside it when it was built (ruling B62).
+// printSelf shows this program's own SHA-256 before anything is typed into it. It catches an accident
+// (the wrong file, an old build) and nothing more: a bad tool would print the right number. The
+// check that counts is the owner's Get-FileHash, run before this program (docs/first-release.md).
 func printSelf() {
 	sum, err := selfSHA()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning: this tool could not hash itself:", err)
 		return
 	}
-	fmt.Printf("this tool: sha256 %s\n", sum)
+	fmt.Printf("this tool: sha256 %s (an accident check only; your Get-FileHash is the real one)\n", sum)
 }
 
 func selfSHA() (string, error) {

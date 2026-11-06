@@ -11,15 +11,20 @@ Four short steps. About 5 minutes.
 **(a) Wait for the lead to say the files are ready**, in `C:\Users\Admin\Desktop\AI\signing\0.2.0`, `0.2.1` and `0.2.2`. The lead also tells
 you the SHA-256 of the signing tool.
 
-**(b) Sign three times.** Start menu → *Terminal*. Paste one line at a time. Each asks for the passphrase once and takes about 25 seconds.
+**(b) Check the tool first.** Start menu → *Terminal*. Run this before anything else, and compare the `Hash` it prints with the value the lead gave
+you. Capital letters do not matter. If they differ, stop: do not type the passphrase, and tell the lead.
+
+    Get-FileHash C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe
+
+**Sign three times.** In the same window, paste one line at a time. Each asks for the passphrase once and takes about 25 seconds.
 Nothing appears on screen while you type: that is correct.
 
     C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.2.0 -first
     C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.2.1 -prev C:\Users\Admin\Desktop\AI\signing\0.2.0\manifest.json
     C:\Users\Admin\Desktop\AI\signing-tool\signtool.exe sign -dist C:\Users\Admin\Desktop\AI\signing\0.2.2 -prev C:\Users\Admin\Desktop\AI\signing\0.2.1\manifest.json
 
-**Before you type anything**, the first line printed is `this tool: sha256 …`. It must be the value the lead told you (it is also in
-`signtool.exe.txt` beside the tool). If it is not, press Ctrl+C and tell the lead.
+The tool also prints a line `this tool: sha256 …`. That only catches an accident, like the wrong file: a bad tool would print the right number.
+The check that counts is `Get-FileHash` above, because Windows computes it, not the tool.
 
 **Success looks like** `signed: version 0.2.0, release_seq 1, key <your key id>`, then `0.2.1` with `release_seq 2`, then `0.2.2` with
 `release_seq 3`. Each also prints a `notes:` line with the commit it was built from.
@@ -89,10 +94,10 @@ Not the owner's job. In order.
 
     pwsh -File scripts\build-signtool.ps1
 
-It prints the commit and SHA-256 and writes them beside the tool, in `signtool.exe.txt`. The tool prints its own SHA-256 too, so tell the owner
-the value. It refuses to replace the tool unless told to: rebuilding is a separate
+It prints the commit and SHA-256 and writes them beside the tool, in `signtool.exe.txt`. Tell the owner that value: they compare
+it with `Get-FileHash` before running the tool. The line the tool prints about itself is only an accident check. It refuses to replace the tool unless told to: rebuilding is a separate
 reviewed step, after reading the diff of `cmd/signtool`, `internal/sign`, `internal/release`, `internal/trust`, `protocol` and `scripts`
-(`-Rebuild`). Never in the session where the passphrase is typed.
+(`-Rebuild`). Never rebuild it right before signing: what protects the passphrase is that the owner compares the tool with a hash fixed earlier.
 
 **3. Build the three folders.** Each refuses a dirty tree, prints the commit, and refuses engine zips that do not match `engine.lock`.
 
@@ -103,7 +108,9 @@ reviewed step, after reading the diff of `cmd/signtool`, `internal/sign`, `inter
 0.2.2 is the same source with one link flag (`-X main.sabotage=unhealthy-0.2.2`) that keeps it from ever reporting healthy, so the launcher
 has something to take back (ruling B27). Nothing changes in the source, and the flag has no effect on any other version.
 
-**4. Smoke test the built files.** Never in the session where the passphrase is typed.
+**4. Smoke test the built files.** Run it before the owner signs, in another terminal. That is not isolation: it is the same Windows account, and a
+program it runs could change files that account can write. What makes it acceptable is the pin: the engine is hash-checked first, and the owner's
+`Get-FileHash` shows whether the signing tool was changed.
 
     pwsh -File scripts\smoke-gpu.ps1 -Dist C:\Users\Admin\Desktop\AI\signing\0.2.0
 

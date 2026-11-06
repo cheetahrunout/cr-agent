@@ -36,10 +36,11 @@ type Config struct {
 
 // Names of the secrets and state files.
 const (
-	SecretMachineKey = "machine-key"
-	SecretHFToken    = "hf-token"
-	SecretApprovals  = "approvals"
-	StateModels      = "models"
+	SecretMachineKey  = "machine-key"
+	SecretHFToken     = "hf-token"
+	SecretApprovals   = "approvals"
+	SecretModelHashes = "model-hashes"
+	StateModels       = "models"
 )
 
 // ErrNotFound is returned for a secret or state file that does not exist.

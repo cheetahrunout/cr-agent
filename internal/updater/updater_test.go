@@ -715,3 +715,38 @@ func TestDailyCheckRefuses(t *testing.T) {
 		t.Fatalf("redirect: %v", err)
 	}
 }
+
+// A download whose connection stays open and delivers nothing is cancelled, and resumed.
+func TestStalledDownloadIsCancelled(t *testing.T) {
+	w := newWorld(t)
+	w.publish(spec("0.1.1", 2))
+	w.srv.StallAfter, w.srv.StallTimes = 100_000, 1
+	u := w.updater("0.1.0")
+	u.cfg.StallAfter = 200 * time.Millisecond
+	t0 := time.Now()
+	if err := u.Update(context.Background(), "0.1.1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(t0); el > 20*time.Second {
+		t.Fatalf("took %v", el)
+	}
+	if n := w.srv.Count("/cdn/"); n != 2 {
+		t.Fatalf("%d asset requests, want 2 (one stalled, one resumed)", n)
+	}
+}
+
+// The tray's install ignores min_hub_version: that value is compared with what the hub says it is.
+func TestLocalInstallIgnoresTheHubsVersion(t *testing.T) {
+	w := newWorld(t)
+	s := spec("0.1.1", 2)
+	s.MinHub = "9.0.0"
+	w.publish(s)
+	u := w.updater("0.1.0")
+	var ue *Error
+	if err := u.Update(context.Background(), "0.1.1", nil); !errors.As(err, &ue) || ue.Code != "hub_too_old" {
+		t.Fatalf("from the hub: %v", err)
+	}
+	if err := u.UpdateLocal(context.Background(), "0.1.1", nil); err != nil {
+		t.Fatalf("from the tray: %v", err)
+	}
+}

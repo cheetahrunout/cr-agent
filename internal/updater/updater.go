@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cheetahrunout/cr-agent/internal/confine"
@@ -49,6 +50,7 @@ type Config struct {
 	StopEngine func()        // called before the pointer is flipped
 	Now        func() time.Time
 	RetryDelay time.Duration // between download attempts, multiplied by the attempt (1 s)
+	StallAfter time.Duration // a download that delivers no bytes for this long is cancelled (60 s)
 }
 
 // Error is a refused or failed update, shaped for cmd.err.
@@ -114,6 +116,9 @@ func New(cfg Config) (*Updater, error) {
 	}
 	if cfg.RetryDelay <= 0 {
 		cfg.RetryDelay = time.Second
+	}
+	if cfg.StallAfter <= 0 {
+		cfg.StallAfter = 60 * time.Second
 	}
 	if !layout.ValidVersion(cfg.Version) {
 		return nil, errors.New("updater: bad running version")
@@ -465,6 +470,16 @@ func semverLess(a, b string) bool {
 // Update installs a version and flips the launcher's pointer to it. When it returns nil the caller
 // exits with layout.ExitRestart and the launcher starts the new version on trial.
 func (u *Updater) Update(ctx context.Context, version string, progress Progress) error {
+	return u.update(ctx, version, progress, true)
+}
+
+// UpdateLocal is Update started by the host on the PC. It skips min_hub_version: the hub's version
+// comes from the hub's welcome, so a hub could otherwise use it to block the tray's way past the hub.
+func (u *Updater) UpdateLocal(ctx context.Context, version string, progress Progress) error {
+	return u.update(ctx, version, progress, false)
+}
+
+func (u *Updater) update(ctx context.Context, version string, progress Progress, checkHub bool) error {
 	if progress == nil {
 		progress = func(string, float64) {}
 	}
@@ -514,7 +529,7 @@ func (u *Updater) Update(ctx context.Context, version string, progress Progress)
 	if unverified && semverLess(version, u.cfg.Version) {
 		return failf("the release was refused: %s is older than the running %s, whose signed manifest could not be checked yet", version, u.cfg.Version)
 	}
-	if hub := ""; u.cfg.HubVersion != nil && m.MinHubVersion != "" {
+	if hub := ""; checkHub && u.cfg.HubVersion != nil && m.MinHubVersion != "" {
 		if hub = u.cfg.HubVersion(); release.ValidVersion(hub) && semverLess(hub, m.MinHubVersion) {
 			return &Error{Code: "hub_too_old", Msg: "this release needs hub " + m.MinHubVersion + " or newer"}
 		}
@@ -676,18 +691,25 @@ func (u *Updater) download(ctx context.Context, version string, a release.Archiv
 		fh.Seek(have, io.SeekStart)
 		resumed := have > 0
 		if have < a.Size {
-			body, offset, size, err := u.f.open(ctx, "v"+version+"/"+a.Name, have)
+			// A connection that stays open and delivers nothing must not hold the update for ever.
+			actx, cancelAttempt := context.WithCancel(ctx)
+			var stalled atomic.Bool
+			watchdog := time.AfterFunc(u.cfg.StallAfter, func() { stalled.Store(true); cancelAttempt() })
+			stop := func() { watchdog.Stop(); cancelAttempt() }
+			body, offset, size, err := u.f.open(actx, "v"+version+"/"+a.Name, have)
 			var se *statusError
 			if (err == nil && size >= 0 && size != a.Size) || (errors.As(err, &se) && se.code == http.StatusRequestedRangeNotSatisfiable) {
 				// The file on the server has another size than the manifest lists: not this release's archive.
 				if body != nil {
 					body.Close()
 				}
+				stop()
 				fh.Close()
 				os.Remove(part)
 				return "", failf("%s does not match the manifest (size)", a.Name)
 			}
 			if err != nil {
+				stop()
 				fh.Close()
 				lastErr = err
 				if errors.As(err, &se) && se.code >= 400 && se.code < 500 {
@@ -705,6 +727,7 @@ func (u *Updater) download(ctx context.Context, version string, a release.Archiv
 			for have < a.Size {
 				n, rerr := body.Read(buf)
 				if n > 0 {
+					watchdog.Reset(u.cfg.StallAfter)
 					if have+int64(n) > a.Size {
 						rerr = errors.New("more bytes than the manifest lists")
 						n = 0
@@ -722,7 +745,11 @@ func (u *Updater) download(ctx context.Context, version string, a release.Archiv
 					break
 				}
 			}
+			stop()
 			body.Close()
+			if stalled.Load() {
+				lastErr = fmt.Errorf("no bytes for %s", u.cfg.StallAfter)
+			}
 		}
 		fh.Sync()
 		fh.Close()

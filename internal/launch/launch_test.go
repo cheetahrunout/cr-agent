@@ -169,7 +169,6 @@ func TestUnhealthyVersionIsReverted(t *testing.T) {
 	w.install("0.1.1", true)
 	w.install("0.1.2", true)
 	layout.WritePointer(w.root, pending("0.1.2", "0.1.1"))
-	w.markHealthy("0.1.2") // a stale mark from an earlier attempt must not pass the gate
 	w.behave["0.1.1"] = func(p *fakeProc, _ int) { time.Sleep(30 * time.Millisecond); p.exit(ExitQuit) }
 	t0 := time.Now()
 	code, started := w.run()
@@ -302,5 +301,107 @@ func TestVerifyManifestPairStates(t *testing.T) {
 	os.Remove(m + ".minisig")
 	if err := Verify(w.root, "0.1.0", w.r.Keys); err == nil {
 		t.Fatal("a manifest without a signature was accepted")
+	}
+}
+
+// The mark is written, and the release committed, in the last moment before the deadline, and even
+// between the last poll and the deadline: the launcher must not revert past that commit.
+func TestGateJudgesTheMarkAfterTheKill(t *testing.T) {
+	w := newWorld(t)
+	w.r.defaults()
+	w.r.Gate, w.r.Poll = 200*time.Millisecond, time.Hour // no poll sees it: only the check at the deadline can
+	p := &fakeProc{done: make(chan struct{})}
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		w.markHealthy("0.1.1")
+	}()
+	// The first check runs at once, before the mark; then only the deadline.
+	if ok, why := w.r.gate(p, "0.1.1", time.Now()); !ok {
+		t.Fatalf("failed: %s", why)
+	}
+	if !p.killed {
+		t.Fatal("the mark was judged while the process could still write")
+	}
+}
+
+// Healthy, then ended in any way: the gate is passed, and the version is not reverted.
+func TestExitAfterHealthyIsNotReverted(t *testing.T) {
+	w := newWorld(t)
+	w.install("0.1.1", true)
+	w.install("0.1.2", true)
+	layout.WritePointer(w.root, pending("0.1.2", "0.1.1"))
+	w.behave["0.1.2"] = func(p *fakeProc, n int) {
+		if n == 1 {
+			w.markHealthy("0.1.2")
+			p.exit(3) // a crash right after the commit
+			return
+		}
+		p.exit(ExitQuit)
+	}
+	code, started := w.run()
+	if code != 0 || started != "0.1.2 0.1.2" {
+		t.Fatalf("exit %d, started %q", code, started)
+	}
+	if q := w.pointer(); q.Version != "0.1.2" || q.PendingSince != nil {
+		t.Fatalf("pointer %+v", q)
+	}
+}
+
+// A reboot during a trial: the mark from that trial stands, so a committed release is not reverted.
+func TestMarkFromAnInterruptedTrialStands(t *testing.T) {
+	w := newWorld(t)
+	w.install("0.1.1", true)
+	w.install("0.1.2", true)
+	layout.WritePointer(w.root, pending("0.1.2", "0.1.1"))
+	w.markHealthy("0.1.2")
+	w.behave["0.1.2"] = func(p *fakeProc, _ int) { p.exit(ExitQuit) }
+	if code, started := w.run(); code != 0 || started != "0.1.2" {
+		t.Fatalf("exit %d, started %q", code, started)
+	}
+	if q := w.pointer(); q.Version != "0.1.2" {
+		t.Fatalf("pointer %+v", q)
+	}
+}
+
+// A revert never leaves a pointer to a version the launcher would refuse.
+func TestRevertChecksThePreviousVersion(t *testing.T) {
+	w := newWorld(t)
+	w.install("0.1.1", true)
+	w.install("0.1.2", true)
+	os.WriteFile(layout.AgentExe(w.root, "0.1.1"), []byte("another program"), 0o755)
+	layout.WritePointer(w.root, pending("0.1.2", "0.1.1"))
+	w.behave["0.1.2"] = func(p *fakeProc, _ int) { p.exit(1) }
+	code, started := w.run()
+	if code != 1 || started != "0.1.2" {
+		t.Fatalf("exit %d, started %q", code, started)
+	}
+	if q := w.pointer(); q.Version != "0.1.2" || q.PendingSince == nil {
+		t.Fatalf("the pointer moved to a version that cannot start: %+v", q)
+	}
+}
+
+// The launcher tells the host once when it gives up, without advising a reinstall.
+func TestGivingUpTellsTheHost(t *testing.T) {
+	w := newWorld(t)
+	w.install("0.1.0", true)
+	layout.WritePointer(w.root, layout.Pointer{Version: "0.1.0"})
+	w.behave["0.1.0"] = func(p *fakeProc, _ int) { p.exit(1) }
+	var said []string
+	w.r.Notify = func(s string) { said = append(said, s) }
+	if code, started := w.run(); code != 1 || started != "0.1.0 0.1.0 0.1.0" {
+		t.Fatalf("exit %d, started %q", code, started)
+	}
+	if len(said) != 1 || strings.Contains(strings.ToLower(said[0]), "install") {
+		t.Fatalf("told the host %q", said)
+	}
+	// A refusal (another copy is running) is not worth a message.
+	w2 := newWorld(t)
+	w2.install("0.1.0", true)
+	layout.WritePointer(w2.root, layout.Pointer{Version: "0.1.0"})
+	w2.behave["0.1.0"] = func(p *fakeProc, _ int) { p.exit(ExitRefused) }
+	said = nil
+	w2.r.Notify = func(s string) { said = append(said, s) }
+	if code, _ := w2.run(); code != ExitRefused || len(said) != 0 {
+		t.Fatalf("exit %d, told %q", code, said)
 	}
 }

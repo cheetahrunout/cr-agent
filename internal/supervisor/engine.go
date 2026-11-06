@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -134,6 +135,37 @@ func (e *Engine) waitHealthy(ctx context.Context, deadline time.Duration) error 
 			return fmt.Errorf("engine not healthy: %w", ctx.Err())
 		case <-tick.C:
 		}
+	}
+}
+
+var reCUDADevice = regexp.MustCompile(`(?m)^\s*CUDA\d+:`)
+
+// ProbeCUDA asks the engine, under the low-integrity token, with no model and no GPU selection,
+// whether it sees a CUDA device: llama-server --list-devices. Nothing the hub sends has a part in it.
+func ProbeCUDA(engineDir string) (bool, error) {
+	if engineDir == "" {
+		return false, errors.New("no engine folder")
+	}
+	dir, err := filepath.Abs(engineDir)
+	if err != nil {
+		return false, err
+	}
+	p, err := spawn(spawnOptions{Exe: filepath.Join(dir, "llama-server.exe"), Args: []string{"--list-devices"}, Dir: dir, LowIL: true})
+	if err != nil {
+		return false, err
+	}
+	defer p.out.Close()
+	defer p.Kill()
+	out := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(io.LimitReader(p.out, 1<<20))
+		out <- b
+	}()
+	select {
+	case b := <-out:
+		return reCUDADevice.Match(b), nil
+	case <-time.After(30 * time.Second):
+		return false, errors.New("the device list did not come")
 	}
 }
 

@@ -91,6 +91,13 @@ var ErrSandboxUnavailable = errors.New("the engine's sandbox cannot be used on t
 // ErrEngineExited is returned when llama-server exits before it is healthy.
 var ErrEngineExited = errors.New("engine exited before it was healthy")
 
+// ErrEngineOutOfMemory is an engine that exited because the GPU had no room for the model. It also
+// wraps ErrEngineExited.
+var ErrEngineOutOfMemory = fmt.Errorf("%w: out of GPU memory", ErrEngineExited)
+
+// reOutOfMemory is what the engine says then, in the lines the allow-list lets through.
+var reOutOfMemory = regexp.MustCompile(`(?i)out of memory|failed to allocate|unable to allocate`)
+
 // Start launches llama-server and returns once /health answers 200 and the port is owned by the child.
 func Start(ctx context.Context, c Config) (*Engine, error) {
 	log := c.Log
@@ -183,7 +190,10 @@ func (e *Engine) waitHealthy(ctx context.Context, deadline time.Duration) error 
 		select {
 		case <-e.p.Done():
 			<-e.pumpDone
-			return fmt.Errorf("%w (exit code %d): %s", ErrEngineExited, e.p.ExitCode(), e.lastLines())
+			if lines := e.lastLines(); reOutOfMemory.MatchString(lines) {
+				return fmt.Errorf("%w (exit code %d): %s", ErrEngineOutOfMemory, e.p.ExitCode(), lines)
+			}
+			return fmt.Errorf("%w (exit code %#x): %s", ErrEngineExited, e.p.ExitCode(), e.lastLines())
 		case <-ctx.Done():
 			return fmt.Errorf("engine not healthy: %w", ctx.Err())
 		case <-tick.C:

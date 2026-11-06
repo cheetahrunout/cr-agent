@@ -302,7 +302,7 @@ func grantRead(dir string, sid *windows.SID) error {
 
 // allPackages is ALL APPLICATION PACKAGES, the SID every read grant for the sandbox goes to. Not the
 // container's own, for a measured reason: with the container's own SID on a file, a low-integrity process
-// no longer gets it (llama-server hangs loading such DLLs, and cannot open such a model), and an older
+// no longer gets it (llama-server cannot load such DLLs, and cannot open such a model), and an older
 // version of this agent after a rollback is one. The cost: any other AppContainer on this PC can read these
 // folders too. They hold the signed engine and models, and no other program gains anything.
 func allPackages() (*windows.SID, error) { return windows.StringToSid("S-1-15-2-1") }

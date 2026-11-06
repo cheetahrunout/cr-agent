@@ -14,7 +14,8 @@ type File struct {
 	Vocab      int
 	Template   bool
 	SplitCount int
-	DataBytes  int // bytes of fake weights per tensor
+	DataBytes  int  // bytes of fake weights per tensor
+	NoHeads    bool // no attention head counts in the header: the fit check's unknown layout
 }
 
 // Default is a 2-block "llama" model.
@@ -51,6 +52,9 @@ func Build(f File) []byte {
 	b.u32(3)
 	b.u64(uint64(len(names)))
 	kvs := 9
+	if f.NoHeads {
+		kvs -= 2
+	}
 	if f.Template {
 		kvs++
 	}
@@ -64,8 +68,10 @@ func Build(f File) []byte {
 	b.kvU32(f.Arch+".block_count", uint32(f.Blocks))
 	b.kvU32(f.Arch+".context_length", uint32(f.Ctx))
 	b.kvU32(f.Arch+".embedding_length", 64)
-	b.kvU32(f.Arch+".attention.head_count", 4)
-	b.kvU32(f.Arch+".attention.head_count_kv", 2)
+	if !f.NoHeads {
+		b.kvU32(f.Arch+".attention.head_count", 4)
+		b.kvU32(f.Arch+".attention.head_count_kv", 2)
+	}
 	b.str("tokenizer.ggml.tokens")
 	b.u32(9) // array
 	b.u32(8) // of strings

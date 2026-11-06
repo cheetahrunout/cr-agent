@@ -96,6 +96,10 @@ func TestAgainstMeasuredLoads(t *testing.T) {
 		measuredMB int64 // rise of GPU memory in use during the load (includes the CUDA context)
 	}{
 		{`C:\Users\Admin\Documents\hfdownloader\models\Qwen3.6Q6_K.gguf`, protocol.Layers(20), 8192, 14392},
+		{`C:\Users\Admin\Documents\hfdownloader\models\Qwen3.8-27B-UD-Q5_K_XL.gguf`, protocol.AllLayers(), 32768, 20993},
+		{`C:\Users\Admin\Documents\hfdownloader\models\Qwen3.8-27B-UD-Q5_K_XL.gguf`, protocol.AllLayers(), 8192, 19428},
+		{`C:\Users\Admin\Documents\hfdownloader\models\Qwen3.6Q4_K_XL.gguf`, protocol.AllLayers(), 32768, 19015},
+		{`C:\Users\Admin\Documents\hfdownloader\models\Qwen3.6Q6_K.gguf`, protocol.Layers(30), 16384, 21183},
 	} {
 		f, err := os.Open(c.path)
 		if err != nil {
@@ -119,5 +123,90 @@ func TestAgainstMeasuredLoads(t *testing.T) {
 		if ratio < 0.85 || ratio > 1.15 { // §12.2: the constants are good to ±15 %
 			t.Errorf("estimate is off by more than 15 %%")
 		}
+	}
+}
+
+// A hybrid model holds a KV cache only on the layers that have attention heads (qwen35: 1 in 4).
+func TestPerBlockHeadCounts(t *testing.T) {
+	per := make([]int64, 8)
+	per[3], per[7] = 4, 4
+	h := &gguf.Header{Arch: "some-hybrid", BlockCount: 8, HeadCount: 24, HeadCountKV: 4, HeadCountKVByBlock: per, KeyLength: 256, ValueLength: 256, EmbeddingLength: 5120, NVocab: 100}
+	e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1024, "f16"))
+	if want := int64(2 * 4 * 512 * 2 * 1024); e.KV != want || e.Uncertain {
+		t.Fatalf("KV %d, want %d, uncertain %v", e.KV, want, e.Uncertain)
+	}
+	// Only the blocks on the GPU count: the last two of 8 hold one with heads.
+	if e := For(h, map[string]int64{}, settings(protocol.Layers(3), 1024, "f16")); e.KV != int64(4*512*2*1024) {
+		t.Fatalf("partial KV %d", e.KV)
+	}
+}
+
+// key_length and value_length are used for any architecture, known to the agent or not.
+func TestKeyAndValueLengths(t *testing.T) {
+	h := &gguf.Header{Arch: "some-new-arch", BlockCount: 2, HeadCount: 8, HeadCountKV: 2, KeyLength: 100, ValueLength: 50, EmbeddingLength: 4096}
+	e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1000, "f16"))
+	if want := int64(2 * 2 * 150 * 2 * 1000); e.KV != want || e.Uncertain {
+		t.Fatalf("KV %d, want %d, uncertain %v", e.KV, want, e.Uncertain)
+	}
+}
+
+// The 20 % fallback is only for a header that lacks what it takes, and says so.
+func TestUnknownLayoutIsMarked(t *testing.T) {
+	h := &gguf.Header{Arch: "some-new-arch", BlockCount: 2, EmbeddingLength: 1000}
+	e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1000, "f16"))
+	if !e.Uncertain || e.KV != int64(2*2*1000*2*1000*1.2) {
+		t.Fatalf("%+v", e)
+	}
+}
+
+// Recurrent and embedding models hold no cache that grows with the context, and that is known, not a guess.
+func TestArchitecturesWithNoKVCache(t *testing.T) {
+	for _, arch := range []string{"rwkv7", "mamba2", "bert"} {
+		e := For(&gguf.Header{Arch: arch, BlockCount: 4, EmbeddingLength: 1000}, map[string]int64{}, settings(protocol.AllLayers(), 32768, "f16"))
+		if e.KV != 0 || e.Uncertain {
+			t.Errorf("%s: %+v", arch, e)
+		}
+	}
+}
+
+// Sliding-window layers hold n_swa + n_ubatch cells; the others the whole context. gemma3: 5 of 6 windowed.
+func TestSlidingWindowLayers(t *testing.T) {
+	h := &gguf.Header{Arch: "gemma3", BlockCount: 6, HeadCount: 4, HeadCountKV: 4, KeyLength: 256, ValueLength: 256, EmbeddingLength: 1024, SlidingWindow: 512}
+	e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 32768, "f16"))
+	block := func(tokens int64) int64 { return 4 * 512 * 2 * tokens }
+	if want := 5*block(1024) + block(32768); e.KV != want {
+		t.Fatalf("KV %d, want %d", e.KV, want)
+	}
+	// A window with no known pattern counts every layer full: a little over, never far under.
+	h.Arch = "no-such-arch"
+	if e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 32768, "f16")); e.KV != 6*block(32768) {
+		t.Fatalf("unknown pattern: %d", e.KV)
+	}
+	// The file's own pattern wins.
+	h.SWAPattern = []int64{1, 1, 0, 0, 0, 0}
+	if e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 32768, "f16")); e.KV != 2*block(1024)+4*block(32768) {
+		t.Fatalf("file pattern: %d", e.KV)
+	}
+}
+
+// qwen35 states head_count_kv once, but only every 4th block has a cache, by llama.cpp's default interval.
+func TestHybridModelsHoldACacheOnlyOnAttentionBlocks(t *testing.T) {
+	h := &gguf.Header{Arch: "qwen35", BlockCount: 8, HeadCount: 24, HeadCountKV: 4, KeyLength: 256, ValueLength: 256, EmbeddingLength: 5120}
+	block := int64(4 * 512 * 2 * 1024)
+	if e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1024, "f16")); e.KV != 2*block || e.Uncertain {
+		t.Fatalf("default interval: %+v", e)
+	}
+	// The file's interval and list win; another architecture has none unless the file says so.
+	h.FullAttentionInterval = 2
+	if e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1024, "f16")); e.KV != 4*block {
+		t.Fatalf("file's interval: %+v", e)
+	}
+	h.RecurrentLayers = []int64{1, 1, 1, 1, 1, 1, 1, 0}
+	if e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1024, "f16")); e.KV != block {
+		t.Fatalf("file's list: %+v", e)
+	}
+	h = &gguf.Header{Arch: "qwen3", BlockCount: 8, HeadCount: 24, HeadCountKV: 4, KeyLength: 256, ValueLength: 256, EmbeddingLength: 5120}
+	if e := For(h, map[string]int64{}, settings(protocol.AllLayers(), 1024, "f16")); e.KV != 8*block {
+		t.Fatalf("not hybrid: %+v", e)
 	}
 }

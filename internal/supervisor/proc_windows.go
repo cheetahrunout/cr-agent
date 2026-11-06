@@ -29,6 +29,9 @@ type proc struct {
 	peak     uint64
 }
 
+// engineErrorMode is SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX.
+const engineErrorMode = windows.SEM_FAILCRITICALERRORS | windows.SEM_NOGPFAULTERRORBOX | windows.SEM_NOOPENFILEERRORBOX
+
 const (
 	jobObjectBasicUIRestrictions = 4    // JobObjectBasicUIRestrictions
 	uiRestrictAll                = 0xFF // every JOB_OBJECT_UILIMIT_ flag
@@ -151,7 +154,10 @@ func spawn(o spawnOptions) (*proc, error) {
 	}
 	env := envBlock(childEnv(o.GPUSelect))
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT |
-		windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_DEFAULT_ERROR_MODE)
+		windows.EXTENDED_STARTUPINFO_PRESENT)
+	// The child inherits this. Without it, a missing or unreadable DLL puts up a system error box on the
+	// host's real desktop, even from a private one, and the process waits there until someone closes it.
+	windows.SetErrorMode(engineErrorMode)
 
 	var caps securityCapabilities
 	var pi windows.ProcessInformation

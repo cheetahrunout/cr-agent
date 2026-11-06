@@ -21,6 +21,10 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/cheetahrunout/cr-agent/internal/fit"
+	"github.com/cheetahrunout/cr-agent/internal/gguf"
+	"github.com/cheetahrunout/cr-agent/internal/protocol"
 )
 
 // sandboxChild runs inside the sandbox: this test binary, started again by TestSandboxBoundary.
@@ -921,6 +925,9 @@ func clipChild(formatName, known, written string) {
 // A control with the job's UI limits off shows what the limits stop. A clipboard this test cannot open, or that a
 // child could not get open, proves nothing, so that is a skip with its reason, never a pass.
 func TestSandboxCannotUseTheClipboard(t *testing.T) {
+	if os.Getenv("CI") == "" && os.Getenv("CRAGENT_TEST_DESKTOP") == "" {
+		t.Skip("this adds to the session's clipboard, so it runs only on CI or with CRAGENT_TEST_DESKTOP=1")
+	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	const known = "known text the sandbox must not read"
@@ -983,4 +990,187 @@ func TestSandboxCannotUseTheClipboard(t *testing.T) {
 			t.Skipf("%s: the child never got the clipboard open, so the data calls were not tried: %s", c.name, out)
 		}
 	}
+}
+
+// The engine inherits the mode that keeps Windows from putting up a system error box, at both levels. The
+// child must not be a Go program: Go's runtime sets this mode for itself at start, which would hide a failure.
+// So the parent asks Windows what a plain system program was started with.
+func TestChildCannotPutUpASystemErrorBox(t *testing.T) {
+	whoami := sys32(t, "whoami.exe")
+	query := windows.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryInformationProcess")
+	const processDefaultHardErrorMode = 12
+	for _, level := range []Level{LevelAppContainer, LevelLowIntegrity} {
+		p, err := spawn(spawnOptions{Exe: whoami, Dir: os.TempDir(), Level: level})
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, p.out)
+		<-p.Done()
+		var raw, n uint32
+		r, _, _ := query.Call(uintptr(p.handle), processDefaultHardErrorMode, uintptr(unsafe.Pointer(&raw)), 4, uintptr(unsafe.Pointer(&n)))
+		p.Kill()
+		p.out.Close()
+		if r != 0 {
+			t.Fatalf("%v: NtQueryInformationProcess %#x", level, r)
+		}
+		mode := raw ^ windows.SEM_FAILCRITICALERRORS // the kernel holds this one bit inverted, as GetErrorMode shows
+		t.Logf("%v: error mode %#x", level, mode)
+		if mode&engineErrorMode != engineErrorMode {
+			t.Errorf("%v: error mode %#x, want %#x set", level, mode, uint32(engineErrorMode))
+		}
+	}
+}
+
+// systemPopups is how many system error boxes Windows has logged (System log, id 26).
+func systemPopups(t *testing.T) int {
+	t.Helper()
+	out, err := exec.Command("wevtutil", "qe", "System", "/q:*[System[(EventID=26)]]", "/f:text", "/c:100000").Output()
+	if err != nil {
+		t.Skipf("the System log cannot be read here: %v", err)
+	}
+	return strings.Count(string(out), "Event[")
+}
+
+// An engine without its DLLs: a quick engine error, no system error box, at both levels. It needs the real
+// engine's program, without which this cannot show a missing DLL.
+func TestRealEngineWithoutItsDLLs(t *testing.T) {
+	src := os.Getenv("CRAGENT_ENGINE_DIR")
+	if src == "" {
+		t.Skip("CRAGENT_ENGINE_DIR not set")
+	}
+	b, err := os.ReadFile(filepath.Join(src, "llama-server.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := systemPopups(t)
+	for _, level := range []Level{LevelAppContainer, LevelLowIntegrity} {
+		dir, models := t.TempDir(), t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "llama-server.exe"), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		model := filepath.Join(models, "m.gguf")
+		os.WriteFile(model, []byte("x"), 0o644)
+		t0 := time.Now()
+		_, err := Start(context.Background(), Config{EngineDir: dir, ModelPath: model, ModelGrant: models, Alias: "m", Level: level, Deadline: 30 * time.Second, Settings: DefaultSettings(4)})
+		el := time.Since(t0)
+		t.Logf("%v: %v in %v", level, err, el.Round(time.Millisecond))
+		if !errors.Is(err, ErrEngineExited) {
+			t.Errorf("%v: %v", level, err)
+		}
+		if el > 5*time.Second {
+			t.Errorf("%v: took %v, as if waiting on a box", level, el)
+		}
+	}
+	if after := systemPopups(t); after != before {
+		t.Errorf("%d system error boxes", after-before)
+	}
+}
+
+// fitCase is a real load measured against the estimate.
+type fitCase struct {
+	file   string
+	layers protocol.GPULayers
+	ctx    int
+}
+
+// usedMB is the GPU memory in use, by nvidia-smi.
+func usedMB(t *testing.T) int64 {
+	t.Helper()
+	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mb int64
+	fmt.Sscan(strings.TrimSpace(string(out)), &mb)
+	return mb
+}
+
+func restAfterStop(t *testing.T, want int64) int64 {
+	t.Helper()
+	var now int64
+	for i := 0; i < 40; i++ {
+		now = usedMB(t)
+		if now <= want+150 {
+			return now
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Logf("the GPU is at %d MiB, was %d: other programs use it too, so this alone proves nothing", now, want)
+	return now
+}
+
+// The estimate against reality, on the owner's models, read in place at low integrity.
+// CRAGENT_TEST_FIT=<model folder> CRAGENT_ENGINE_DIR=<engine> go test -v -run TestFitAgainstTheRealEngine ./internal/supervisor
+func TestFitAgainstTheRealEngine(t *testing.T) {
+	dir, models := os.Getenv("CRAGENT_ENGINE_DIR"), os.Getenv("CRAGENT_TEST_FIT")
+	if dir == "" || models == "" {
+		t.Skip("CRAGENT_TEST_FIT and CRAGENT_ENGINE_DIR not set")
+	}
+	for _, c := range []fitCase{
+		{"Qwen3.8-27B-UD-Q5_K_XL.gguf", protocol.AllLayers(), 32768},
+		{"Qwen3.8-27B-UD-Q5_K_XL.gguf", protocol.AllLayers(), 8192},
+		{"Qwen3.6Q4_K_XL.gguf", protocol.AllLayers(), 32768},
+		{"Qwen3.6Q6_K.gguf", protocol.Layers(30), 16384},
+		{"Qwen3.6Q6_K.gguf", protocol.Layers(20), 8192},
+	} {
+		path := filepath.Join(models, c.file)
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, _ := f.Stat()
+		h, err := gguf.Parse(f, gguf.MaxHeaderBytes, time.Now().Add(5*time.Second))
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes, _ := h.TensorBytes(uint64(st.Size()))
+		s := DefaultSettings(8)
+		s.Ctx, s.GPULayers, s.KVType = c.ctx, c.layers, "f16"
+		e := fit.For(h, sizes, s)
+		need := (e.Total() + fit.Reserve) >> 20
+		rest := usedMB(t)
+		eng, err := Start(context.Background(), Config{EngineDir: dir, ModelPath: path, Alias: "m", Level: LevelLowIntegrity, Deadline: 4 * time.Minute, Settings: s})
+		if err != nil {
+			t.Errorf("%s: %v", c.file, err)
+			continue
+		}
+		time.Sleep(1500 * time.Millisecond)
+		measured := usedMB(t) - rest
+		eng.Stop()
+		restAfterStop(t, rest)
+		ratio := float64(need) / float64(measured)
+		t.Logf("%s, %+v, ctx %d: weights %d + KV %d + compute %d + reserve %d = %d MiB; measured %d MiB; ratio %.3f", c.file, c.layers, c.ctx, e.Weights>>20, e.KV>>20, e.Compute>>20, fit.Reserve>>20, need, measured, ratio)
+		if ratio < 0.95 || ratio > 1.15 {
+			t.Errorf("%s at %d: ratio %.3f", c.file, c.ctx, ratio)
+		}
+	}
+}
+
+// A load that truly cannot get its memory ends quickly as out of memory, and nothing stays behind. On this driver a
+// GPU that is merely full does not give that: CUDA spills to system memory and the load succeeds, slowly (see
+// docs/fit-measurements.md). What does is the job's memory cap, which every real engine has.
+func TestRealEngineOutOfMemoryEndsCleanly(t *testing.T) {
+	dir, models := os.Getenv("CRAGENT_ENGINE_DIR"), os.Getenv("CRAGENT_TEST_FIT")
+	if dir == "" || models == "" {
+		t.Skip("CRAGENT_TEST_FIT and CRAGENT_ENGINE_DIR not set")
+	}
+	rest := usedMB(t)
+	s := DefaultSettings(8)
+	s.Ctx, s.GPULayers, s.KVType = 32768, protocol.AllLayers(), "f16"
+	t0 := time.Now()
+	eng, err := Start(context.Background(), Config{EngineDir: dir, ModelPath: filepath.Join(models, "Qwen3.6Q6_K.gguf"), Alias: "m", Level: LevelLowIntegrity, MemLimit: 2 << 30, Deadline: 4 * time.Minute, Settings: s})
+	el := time.Since(t0)
+	if err == nil {
+		eng.Stop()
+		t.Fatalf("it loaded in %v", el)
+	}
+	t.Logf("in %v: %v", el.Round(time.Millisecond), err)
+	if !errors.Is(err, ErrEngineOutOfMemory) {
+		t.Errorf("not recognised as out of memory: %v", err)
+	}
+	if el > time.Minute {
+		t.Errorf("took %v", el)
+	}
+	t.Logf("GPU at rest %d MiB, now %d MiB", rest, restAfterStop(t, rest))
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cheetahrunout/cr-agent/internal/gguf/gguftest"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
 	"github.com/cheetahrunout/cr-agent/internal/store"
 	"github.com/cheetahrunout/cr-agent/internal/supervisor"
@@ -403,5 +404,79 @@ func TestOldNormalIntegritySettingIsNotRead(t *testing.T) {
 	defer a.Shutdown()
 	if a.Level() != supervisor.LevelAppContainer {
 		t.Fatal("the old setting was read")
+	}
+}
+
+// A real out-of-memory load is an engine error with the pre-load check's code, and no offer.
+func TestOutOfMemoryIsItsOwnError(t *testing.T) {
+	probes := 0
+	a := New(Config{Version: "0.1.0", ProbeCUDA: func() (bool, error) { probes++; return false, nil },
+		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			return nil, fmt.Errorf("%w (exit code 1): failed to allocate CUDA0 buffer", supervisor.ErrEngineOutOfMemory)
+		}})
+	defer a.Shutdown()
+	_, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(1))
+	if !errors.Is(err, supervisor.ErrEngineOutOfMemory) || !errors.Is(err, supervisor.ErrEngineExited) {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	code := a.engineErr
+	a.mu.Unlock()
+	if code != protocol.ErrInsufficientVRAM || probes != 0 || a.SandboxBlocked() {
+		t.Fatalf("code %q, probes %d, offer %v", code, probes, a.SandboxBlocked())
+	}
+}
+
+// The hub hears it with the code it maps to insufficient_vram.
+func TestUnknownLayoutTriesAndOutOfMemoryReachesTheHub(t *testing.T) {
+	w := newWorldWith(t, func(c *Config) {
+		c.GPUFree = func(context.Context) (int64, error) { return 1 << 20, nil } // far too little for any estimate
+	})
+	h, _ := w.connect()
+	h.send(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T3","op":"download","args":{"model_id":"tiny-q4_k_m","repo":"unsloth/Tiny-GGUF","commit":"` + commitA + `","files":["Tiny-Q4_K_M.gguf"],"kind":"gguf"}}`)
+	h.until("download", 15*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.done" })
+	load := func(id string) string {
+		return `{"v":1,"t":"cmd","id":"` + id + `","op":"load","args":{"model_id":"tiny-q4_k_m","settings":{"ctx":4096,"gpu_layers":"all","threads":4,"kv_type":"f16","flash_attn":"on"}}}`
+	}
+	// A confident estimate still refuses, with nothing started.
+	h.send(load("c-01JCKZ3Q9X8YB7N6M5P4R3S2T4"))
+	e := h.until("refusal", 5*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.err" })
+	if e["code"] != "insufficient_vram" || len(w.started) != 0 {
+		t.Fatalf("confident: %v, %d starts", e, len(w.started))
+	}
+	// The engine's own out of memory reaches the hub the same way.
+	w.a.cfg.GPUFree = func(context.Context) (int64, error) { return 1 << 40, nil }
+	w.a.cfg.Start = func(ctx context.Context, c supervisor.Config) (Engine, error) {
+		return nil, fmt.Errorf("%w (exit code 1): failed to allocate", supervisor.ErrEngineOutOfMemory)
+	}
+	h.send(load("c-01JCKZ3Q9X8YB7N6M5P4R3S2T5"))
+	e = h.until("engine's refusal", 5*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.err" })
+	if e["code"] != "insufficient_vram" || e["need_mb"] == nil || e["free_mb"] == nil {
+		t.Fatalf("out of memory: %v", e)
+	}
+}
+
+// An estimate on the unknown-layout fallback does not refuse, where a confident one with the same room does.
+func TestUnknownLayoutLetsTheEngineTry(t *testing.T) {
+	w := newWorldWith(t, func(c *Config) {
+		c.GPUFree = func(context.Context) (int64, error) { return 1 << 20, nil }
+	})
+	f := gguftest.Default()
+	f.NoHeads, f.DataBytes = true, 128<<10
+	w.hf.AddRepo("unsloth/NoHeads-GGUF", commitA, false, map[string][]byte{"NoHeads-Q4_K_M.gguf": gguftest.Build(f)})
+	h, _ := w.connect()
+	h.send(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T3","op":"download","args":{"model_id":"noheads-q4_k_m","repo":"unsloth/NoHeads-GGUF","commit":"` + commitA + `","files":["NoHeads-Q4_K_M.gguf"],"kind":"gguf"}}`)
+	h.until("download", 15*time.Second, func(m map[string]any) bool { return m["t"] == "cmd.done" })
+	h.send(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T4","op":"load","args":{"model_id":"noheads-q4_k_m","settings":{"ctx":4096,"gpu_layers":"all","threads":4,"kv_type":"f16","flash_attn":"on"}}}`)
+	e := h.until("the load", 5*time.Second, func(m map[string]any) bool {
+		return (m["t"] == "cmd.done" || m["t"] == "cmd.err") && m["id"] == "c-01JCKZ3Q9X8YB7N6M5P4R3S2T4"
+	})
+	if e["t"] != "cmd.done" {
+		t.Fatalf("refused: %v", e)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.started) != 1 {
+		t.Fatalf("%d starts", len(w.started))
 	}
 }

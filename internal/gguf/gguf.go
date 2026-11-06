@@ -52,6 +52,16 @@ type Header struct {
 	EmbeddingLength int64
 	HeadCount       int64
 	HeadCountKV     int64
+	// HeadCountKVByBlock is head_count_kv per block when the file gives it per block: a layer with 0 holds no
+	// KV cache (hybrid models such as qwen35, with linear attention on most layers). HeadCountKV is its largest.
+	HeadCountKVByBlock []int64
+	// RecurrentLayers is attention.recurrent_layers, one flag per block, and FullAttentionInterval is
+	// full_attention_interval: which blocks of a hybrid model use linear attention and hold no KV cache.
+	RecurrentLayers       []int64
+	FullAttentionInterval int64
+	// SWAPattern is attention.sliding_window_pattern as an array, one flag per block; SWAEvery as a number.
+	SWAPattern      []int64
+	SWAEvery        int64
 	KeyLength       int64
 	ValueLength     int64
 	SlidingWindow   int64
@@ -175,7 +185,8 @@ type value struct {
 	s      string
 	strLen uint64
 	arrLen uint64
-	arrMax int64 // the largest element of a small integer array (per-layer head counts)
+	arrMax int64   // the largest element of a small integer array (per-layer head counts)
+	arr    []int64 // the elements of a small integer array
 }
 
 func (r *reader) scalar(t uint32) (int64, error) {
@@ -259,6 +270,7 @@ func (r *reader) value(t uint32, depth int) (value, error) {
 				if x > v.arrMax {
 					v.arrMax = x
 				}
+				v.arr = append(v.arr, x)
 			}
 		default:
 			return v, r.skip(n * scalarSize(et))
@@ -397,6 +409,20 @@ func Parse(src io.Reader, limit uint64, deadline time.Time) (*Header, error) {
 	h.EmbeddingLength = num(a + "embedding_length")
 	h.HeadCount = num(a + "attention.head_count")
 	h.HeadCountKV = num(a + "attention.head_count_kv")
+	if v, ok := kv[a+"attention.head_count_kv"]; ok && v.kind == tArray {
+		h.HeadCountKVByBlock = v.arr
+	}
+	if v, ok := kv[a+"attention.sliding_window_pattern"]; ok {
+		if v.kind == tArray {
+			h.SWAPattern = v.arr
+		} else {
+			h.SWAEvery = v.i
+		}
+	}
+	if v, ok := kv[a+"attention.recurrent_layers"]; ok && v.kind == tArray {
+		h.RecurrentLayers = v.arr
+	}
+	h.FullAttentionInterval = num(a + "full_attention_interval")
 	h.KeyLength = num(a + "attention.key_length")
 	h.ValueLength = num(a + "attention.value_length")
 	h.SlidingWindow = num(a + "attention.sliding_window")

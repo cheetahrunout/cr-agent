@@ -59,7 +59,7 @@ If low integrity also fails, it is an engine error with its message and no furth
 
 ## Why ALL APPLICATION PACKAGES and not the container's own SID
 
-With the container's own SID on a file, a low-integrity process stops getting that file, though the entry for the user is untouched. On DLLs, llama-server hangs while loading them, one thread waiting in `LpcReply`. On a model, it fails with `failed to open GGUF file`. The cause is not known. It matters because an older agent after a rollback runs under the low-integrity token and uses the same engine folder. With ALL APPLICATION PACKAGES a low-integrity start works, measured on both the engine and an 18 GB model.
+With the container's own SID on a file, a low-integrity process stops getting that file, though the entry for the user is untouched. On DLLs, llama-server cannot load them: Windows puts up a system error box and the process waits on it (what looked like a hang, one thread in `LpcReply`). On a model, it fails with `failed to open GGUF file`. The cause is not known. It matters because an older agent after a rollback runs under the low-integrity token and uses the same engine folder. With ALL APPLICATION PACKAGES a low-integrity start works, measured on both the engine and an 18 GB model.
 
 **Known cost, accepted:** any other AppContainer on the PC can read those two folders. They hold the signed engine and models, and no secrets.
 

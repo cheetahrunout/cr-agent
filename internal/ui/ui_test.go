@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -41,6 +42,9 @@ func TestApprovalText(t *testing.T) {
 func TestAllowDownloadDeadline(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("native dialog: Windows only")
+	}
+	if os.Getenv("CI") == "" && os.Getenv("CRAGENT_TEST_DESKTOP") == "" {
+		t.Skip("this puts a dialog on the desktop, so it runs only on CI or with CRAGENT_TEST_DESKTOP=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()

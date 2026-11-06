@@ -772,6 +772,7 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 	}
 	_ = s.Send(&protocol.CmdAck{ID: id}) // before the first load's hash, which can take a minute
 	path := ""
+	var needMB int64
 	switch {
 	case a.cfg.LocalModelID != "" && args.ModelID == a.cfg.LocalModelID:
 		path = a.cfg.LocalModelPath
@@ -791,7 +792,8 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 			a.cmdErr(s, id, protocol.ErrBadSetting, fe.Field, fe.Msg)
 			return
 		}
-		if refused := a.checkVRAM(s, id, l, args.Settings); refused {
+		var refused bool
+		if refused, needMB = a.checkVRAM(s, id, l, args.Settings); refused {
 			return
 		}
 	default:
@@ -803,6 +805,10 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		code := protocol.ErrEngineFailed
 		if errors.Is(err, errBusy) {
 			code = protocol.ErrBusy
+		}
+		if errors.Is(err, supervisor.ErrEngineOutOfMemory) {
+			a.outOfMemory(s, id, needMB)
+			return
 		}
 		msg := "engine did not start"
 		if errors.Is(err, errNoCUDAUnderLowIL) {
@@ -819,18 +825,21 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 
 // checkVRAM is the pre-load check of ruling B6: the estimate for these settings, from the model's own
 // header, must fit in the free VRAM minus 0.5 GiB. Nothing is adjusted: a load that does not fit is
-// refused with the numbers. It reports whether the load was refused.
-func (a *Agent) checkVRAM(s *link.Session, id string, l *models.Loadable, st protocol.Settings) bool {
+// refused with the numbers. It reports whether the load was refused, and the megabytes it estimated.
+//
+// An estimate that rests on the unknown-layout fallback does not refuse: the engine tries, and a real
+// out-of-memory load ends as an engine error with the same code.
+func (a *Agent) checkVRAM(s *link.Session, id string, l *models.Loadable, st protocol.Settings) (bool, int64) {
 	if a.cfg.GPUFree == nil {
-		return false
+		return false, 0
 	}
 	sizes, ok := l.Header.TensorBytes(uint64(l.Size))
 	if !ok {
-		return false
+		return false, 0
 	}
 	est := fit.For(l.Header, sizes, st)
 	if est.Total() == 0 {
-		return false // nothing goes to the GPU
+		return false, 0 // nothing goes to the GPU
 	}
 	// A model that is loaded now will be replaced by this load: free its memory before measuring.
 	a.mu.Lock()
@@ -842,16 +851,35 @@ func (a *Agent) checkVRAM(s *link.Session, id string, l *models.Loadable, st pro
 	free, err := a.cfg.GPUFree(s.Context())
 	if err != nil {
 		a.log.Warn("free VRAM unknown; loading without the pre-load check", "err", err.Error())
-		return false
+		return false, 0
 	}
 	need, freeMB, fits := fit.Check(est, free)
-	a.log.Info("pre-load check", "need_mb", need, "free_mb", freeMB, "gpu_blocks", est.GPUBlocks, "fits", fits)
+	a.log.Info("pre-load check", "need_mb", need, "free_mb", freeMB, "gpu_blocks", est.GPUBlocks, "fits", fits, "unknown_layout", est.Uncertain)
 	if fits {
-		return false
+		return false, need
+	}
+	if est.Uncertain {
+		a.log.Warn("the estimate rests on the unknown-layout fallback, so the engine tries anyway", "arch", l.Header.Arch, "need_mb", need, "free_mb", freeMB)
+		return false, need
 	}
 	_ = s.Send(&protocol.CmdErr{ID: id, Code: protocol.ErrInsufficientVRAM, NeedMB: &need, FreeMB: &freeMB,
 		Message: "not enough free GPU memory for these settings"})
-	return true
+	return true, need
+}
+
+// outOfMemory answers a load the engine could not fit, with the code of the pre-load check.
+func (a *Agent) outOfMemory(s *link.Session, id string, needMB int64) {
+	e := &protocol.CmdErr{ID: id, Code: protocol.ErrInsufficientVRAM, Message: "the engine ran out of GPU memory loading this model"}
+	if needMB > 0 {
+		e.NeedMB = &needMB
+	}
+	if a.cfg.GPUFree != nil {
+		if free, err := a.cfg.GPUFree(s.Context()); err == nil {
+			mb := free >> 20
+			e.FreeMB = &mb
+		}
+	}
+	_ = s.Send(e)
 }
 
 var errBusy = errors.New("a load is already running, or the PC is paused or asleep")
@@ -951,6 +979,10 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 		a.mu.Unlock()
 	}
 	switch {
+	case errors.Is(err, supervisor.ErrEngineOutOfMemory):
+		// The model did not fit. That says nothing about the sandbox, so no probe and no offer.
+		a.setSandboxResult("failed: the engine ran out of GPU memory at " + level.String())
+		failure = protocol.ErrInsufficientVRAM
 	case errors.Is(err, supervisor.ErrSandboxUnavailable):
 		// An engine error, never a start with weaker isolation (ruling B63). A model can have caused this:
 		// the container's own profile is writable from inside. Start has already made that profile anew and

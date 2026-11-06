@@ -3,6 +3,7 @@
 package tray
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -13,6 +14,9 @@ var procSendMessage = user32.NewProc("SendMessageW")
 
 // The real icon: added to the notification area, updated, clicked through its callback message, removed.
 func TestTrayLifecycle(t *testing.T) {
+	if os.Getenv("CI") == "" && os.Getenv("CRAGENT_TEST_DESKTOP") == "" {
+		t.Skip("this puts an icon and a notification on the desktop, so it runs only on CI or with CRAGENT_TEST_DESKTOP=1")
+	}
 	type choice struct {
 		a   Action
 		arg string

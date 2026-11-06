@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cheetahrunout/cr-agent/internal/layout"
@@ -140,10 +141,23 @@ func healthy(root, version string) bool {
 	return err == nil
 }
 
+// removeOldLaunchers clears launcher.old and launcher.old.N, left by launcher updates: this start runs the new one.
+func (r *Runner) removeOldLaunchers() {
+	entries, err := os.ReadDir(r.Root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if n := e.Name(); n == "launcher.old" || strings.HasPrefix(n, "launcher.old.") {
+			os.Remove(filepath.Join(r.Root, n))
+		}
+	}
+}
+
 // Run is the launcher's loop. It returns the launcher's exit code.
 func (r *Runner) Run() int {
 	r.defaults()
-	os.Remove(filepath.Join(r.Root, "launcher.old")) // left by a launcher update; this start runs the new one
+	r.removeOldLaunchers()
 	crashes := 0
 	for {
 		p, err := layout.ReadPointer(r.Root)

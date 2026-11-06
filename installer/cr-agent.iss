@@ -89,6 +89,7 @@ Type: filesandordirs; Name: "{app}\state"
 Type: files; Name: "{app}\current.json"
 Type: files; Name: "{app}\config.json"
 Type: files; Name: "{app}\launcher.old"
+Type: files; Name: "{app}\launcher.old.*"
 Type: files; Name: "{app}\healthy.*"
 Type: dirifempty; Name: "{app}"
 #endif

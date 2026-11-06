@@ -872,6 +872,21 @@ func (u *Updater) removeExtras(m *release.Manifest) error {
 // replaceLauncher puts a changed launcher in place: the running launcher.exe is renamed to
 // launcher.old (Windows allows renaming a running program) and the new one takes its name, to take
 // effect at the next start (ruling B22).
+// asideName is where the running launcher.exe moves to. Usually launcher.old, but after an earlier launcher update
+// with no launcher restart since, launcher.old is the program still running: Windows refuses to delete it or to
+// rename anything onto it, so the next free launcher.old.N is used. The launcher removes them all when it starts.
+func asideName(root string) string {
+	old := filepath.Join(root, "launcher.old")
+	os.Remove(old)
+	for n := 1; ; n++ {
+		if _, err := os.Lstat(old); os.IsNotExist(err) {
+			return old
+		}
+		old = filepath.Join(root, fmt.Sprintf("launcher.old.%d", n))
+		os.Remove(old)
+	}
+}
+
 func (u *Updater) replaceLauncher(m *release.Manifest) error {
 	f, ok := m.File(m.LauncherPath())
 	if !ok {
@@ -887,8 +902,7 @@ func (u *Updater) replaceLauncher(m *release.Manifest) error {
 	if err != nil {
 		return err
 	}
-	old := filepath.Join(root, "launcher.old")
-	os.Remove(old)
+	old := asideName(root)
 	if _, err := os.Stat(live); err == nil {
 		if err := os.Rename(live, old); err != nil {
 			return err

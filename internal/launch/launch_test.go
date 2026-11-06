@@ -124,12 +124,20 @@ func TestQuitEndsTheLauncher(t *testing.T) {
 	w.install("0.1.0", false) // a fresh install: no manifest yet, started as it is
 	layout.WritePointer(w.root, layout.Pointer{Version: "0.1.0"})
 	os.WriteFile(filepath.Join(w.root, "launcher.old"), []byte("old launcher"), 0o755)
+	os.WriteFile(filepath.Join(w.root, "launcher.old.1"), []byte("older launcher"), 0o755)
+	os.WriteFile(filepath.Join(w.root, "launcher.oldish"), []byte("not ours"), 0o644)
 	w.behave["0.1.0"] = func(p *fakeProc, _ int) { p.exit(ExitQuit) }
 	if code, started := w.run(); code != 0 || started != "0.1.0" {
 		t.Fatalf("exit %d, started %q", code, started)
 	}
 	if _, err := os.Stat(filepath.Join(w.root, "launcher.old")); !os.IsNotExist(err) {
 		t.Fatal("launcher.old was not cleaned up")
+	}
+	if _, err := os.Stat(filepath.Join(w.root, "launcher.old.1")); !os.IsNotExist(err) {
+		t.Fatal("launcher.old.1 was not cleaned up")
+	}
+	if _, err := os.Stat(filepath.Join(w.root, "launcher.oldish")); err != nil {
+		t.Fatal("a file that is not an old launcher was removed")
 	}
 }
 

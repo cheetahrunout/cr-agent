@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cheetahrunout/cr-agent/internal/confine"
 	"github.com/cheetahrunout/cr-agent/internal/gguf"
 	"github.com/cheetahrunout/cr-agent/internal/hf"
 	"github.com/cheetahrunout/cr-agent/internal/hw"
@@ -617,6 +618,22 @@ func (m *Manager) checkHashes(e *Entry, dir string, files []protocol.LocalFile) 
 func (m *Manager) checkHash(e *Entry, path string, f protocol.LocalFile) *Error {
 	st, serr := os.Stat(path)
 	key := ""
+	if serr == nil && hasSecondName(path) {
+		// The file could be changed through the other name with its time put back, which the cache
+		// below would not see. Asked at every load, before the cache.
+		m.mu.Lock()
+		if m.index[e.ModelID] == e {
+			e.State = StateError
+			if e.imported() {
+				e.State = StateChanged
+			}
+			m.saveLocked()
+		}
+		m.mu.Unlock()
+		m.log.Error("load refused: a model file has a second name (a hard link)", "model_id", e.ModelID)
+		m.o.OnChange(true)
+		return errf(protocol.ErrDenied, "a model file has a second name on this PC (a hard link), so it could change unseen; only the host can remove that link")
+	}
 	if serr == nil {
 		key = fmt.Sprintf("%s|%s|%d|%d", path, f.SHA256, st.Size(), st.ModTime().UnixNano())
 		m.mu.Lock()
@@ -656,6 +673,18 @@ func (m *Manager) checkHash(e *Entry, path string, f protocol.LocalFile) *Error 
 	m.hashed[key] = true
 	m.mu.Unlock()
 	return nil
+}
+
+// hasSecondName reports a file with more than one name. A file that cannot be opened has none to
+// report: the hash that follows fails on it.
+func hasSecondName(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	n, err := confine.Links(f)
+	return err == nil && n != 1
 }
 
 // checkFile is the GGUF pre-check: magic, version, caps, and every tensor inside the file.
@@ -711,24 +740,53 @@ func CheckFolder(dir string) (string, error) {
 	return abs, nil
 }
 
-// sweepOldPartials removes .part files nobody resumed for maxAge (§12.4).
+// sweepOldPartials removes .part files nobody resumed for maxAge (§12.4), only where downloads write:
+// <owner>\\<repo>\\<commit[:12]>, and one folder below it. The rest of the model folder is the host's,
+// and a file there called .gguf.part is the host's too (ruling B64). No link is followed.
 func sweepOldPartials(root string, maxAge time.Duration) {
 	cut := time.Now().Add(-maxAge)
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	folders := func(dir string) []string {
+		ents, err := os.ReadDir(dir)
 		if err != nil {
 			return nil
 		}
-		if d.IsDir() {
-			if d.Type()&os.ModeSymlink != 0 || strings.Count(strings.TrimPrefix(path, root), string(filepath.Separator)) > 5 {
-				return filepath.SkipDir
+		var out []string
+		for _, d := range ents {
+			if d.Type()&os.ModeType == os.ModeDir {
+				out = append(out, d.Name())
 			}
-			return nil
 		}
-		if strings.HasSuffix(d.Name(), ".gguf.part") {
+		return out
+	}
+	sweep := func(dir string) {
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, d := range ents {
+			if d.Type()&os.ModeType != 0 || !strings.HasSuffix(d.Name(), ".gguf.part") {
+				continue
+			}
 			if info, err := d.Info(); err == nil && info.ModTime().Before(cut) {
-				os.Remove(path)
+				os.Remove(filepath.Join(dir, d.Name()))
 			}
 		}
-		return nil
-	})
+	}
+	for _, owner := range folders(root) {
+		for _, repo := range folders(filepath.Join(root, owner)) {
+			if id := owner + "/" + repo; !protocol.ValidRepo(id) || reservedRepo(id) {
+				continue
+			}
+			for _, commit := range folders(filepath.Join(root, owner, repo)) {
+				if !reCommitDir.MatchString(commit) {
+					continue
+				}
+				dir := filepath.Join(root, owner, repo, commit)
+				sweep(dir)
+				for _, sub := range folders(dir) {
+					sweep(filepath.Join(dir, sub))
+				}
+			}
+		}
+	}
 }

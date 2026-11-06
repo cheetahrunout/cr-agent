@@ -85,3 +85,30 @@ func TestAddFilesTexts(t *testing.T) {
 		t.Fatalf("result %q", res)
 	}
 }
+
+// Two long names that differ only at the end: the confirmation shows each in full, and each list row
+// ends as its real name ends.
+func TestLongNamesStayApart(t *testing.T) {
+	long := strings.Repeat("a", 90)
+	safeName, evilName := long+"-safe.gguf", long+"-evil.gguf"
+	s := models.Scan{Found: []models.Found{{Key: safeName, Files: []string{safeName}, Size: 1 << 30}, {Key: evilName, Files: []string{evilName}, Size: 1 << 30}}}
+	text := ConfirmAddText(s, []string{safeName, evilName})
+	if !strings.Contains(text, safeName) || !strings.Contains(text, evilName) {
+		t.Fatalf("the confirmation cut a name: %s", text)
+	}
+	rows, _ := listRows(s)
+	if !strings.HasSuffix(rows[0], "-safe.gguf") || !strings.HasSuffix(rows[1], "-evil.gguf") {
+		t.Fatalf("rows %q", rows)
+	}
+	res := ImportResultText([]models.ImportResult{{Key: safeName}, {Key: evilName, Err: "cancelled"}})
+	if !strings.Contains(res, safeName) || !strings.Contains(res, evilName) {
+		t.Fatalf("the result cut a name: %s", res)
+	}
+	// Control and formatting characters stay out of every one of them, and a shortened refusal keeps the end.
+	bad := "evil\u202egnp\n" + long + "-end.gguf"
+	for _, got := range []string{ConfirmAddText(models.Scan{Found: []models.Found{{Key: bad, Files: []string{bad}, Size: 1}}}, []string{bad}), RefusedText(models.Scan{Refused: []models.Refused{{Name: bad, Why: "x"}}})} {
+		if strings.ContainsRune(got, 0x202e) || !strings.Contains(got, "-end.gguf") {
+			t.Fatalf("%q", got)
+		}
+	}
+}

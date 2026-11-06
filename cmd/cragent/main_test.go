@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cheetahrunout/cr-agent/internal/gguf/gguftest"
+	"github.com/cheetahrunout/cr-agent/internal/models"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
+	"github.com/cheetahrunout/cr-agent/internal/store"
 	"github.com/cheetahrunout/cr-agent/internal/updater"
 )
 
@@ -175,5 +179,41 @@ func TestStartFailure(t *testing.T) {
 	}
 	if text := openFailure(`C:\x`, errors.New("config.json is damaged")); !strings.Contains(text, "config.json") || strings.Contains(strings.ToLower(text), "install") {
 		t.Errorf("open failure %q", text)
+	}
+}
+
+type plainProtector struct{}
+
+func (plainProtector) Protect(_ string, b []byte) ([]byte, error)   { return b, nil }
+func (plainProtector) Unprotect(_ string, b []byte) ([]byte, error) { return b, nil }
+
+// A cancelled import still tells the host what happened: what finished before the cancel stays added.
+func TestImportAlwaysTells(t *testing.T) {
+	st, err := store.OpenWith(t.TempDir(), plainProtector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "models")
+	mm, err := models.New(models.Options{Store: st, Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mm.Close()
+	f := gguftest.Default()
+	f.DataBytes = 4096
+	os.WriteFile(filepath.Join(dir, "a.gguf"), gguftest.Build(f), 0o644)
+	f.DataBytes = 8192
+	os.WriteFile(filepath.Join(dir, "b.gguf"), gguftest.Build(f), 0o644)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var told []string
+	closed := false
+	importAndTell(ctx, mm, mm.Scan().Picks([]string{"a.gguf", "b.gguf"}), func(file string, _, _ int64) {
+		if file == "b.gguf" {
+			cancel()
+		}
+	}, func() { closed = true }, func(s string) { told = append(told, s) })
+	if !closed || len(told) != 1 || !strings.Contains(told[0], "Added") || !strings.Contains(told[0], "a.gguf") || !strings.Contains(told[0], "b.gguf: cancelled") {
+		t.Fatalf("closed %v, told %q", closed, told)
 	}
 }

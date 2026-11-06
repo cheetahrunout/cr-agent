@@ -36,6 +36,8 @@ type indexFile struct {
 var (
 	reCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	reSHA    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	// reCommitDir is the folder a download's files go in: Entry.dir's commit[:12].
+	reCommitDir = regexp.MustCompile(`^[0-9a-f]{12}$`)
 )
 
 // valid re-checks an entry read from disk with the same rules as a command: the index sits in a

@@ -76,7 +76,7 @@ func TestHubCannotImport(t *testing.T) {
 	}
 
 	// The host clicks. The hub hears of it in a status frame, and can use it as any other model.
-	r := w.mm.Import(context.Background(), []string{name}, nil)
+	r := w.mm.Import(context.Background(), w.mm.Scan().Picks([]string{name}), nil)
 	if r[0].Err != "" {
 		t.Fatalf("%+v", r)
 	}
@@ -203,7 +203,7 @@ func TestImportRealEngine(t *testing.T) {
 		t.Fatalf("scan: %+v", scan)
 	}
 	t0 := time.Now()
-	res := mm.Import(context.Background(), []string{scan.Found[0].Key}, nil)
+	res := mm.Import(context.Background(), scan.Picks([]string{scan.Found[0].Key}), nil)
 	if res[0].Err != "" {
 		t.Fatalf("import: %+v", res)
 	}

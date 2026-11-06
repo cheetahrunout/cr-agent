@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -76,6 +77,28 @@ type Found struct {
 	Key   string   // the first file's path in the folder, slash-separated: what Import takes
 	Files []string // every part, in order
 	Size  int64
+	Seen  []Stamp // each part as the scan saw it
+}
+
+// Stamp is a file's size and modified time at the moment it was looked at.
+type Stamp struct {
+	Size    int64
+	ModTime time.Time
+}
+
+func (s Stamp) same(st os.FileInfo) bool { return s.Size == st.Size() && s.ModTime.Equal(st.ModTime()) }
+
+// Picks turns the keys chosen in the dialog into the rows the dialog showed.
+func (s Scan) Picks(keys []string) []Found {
+	out := make([]Found, 0, len(keys))
+	for _, k := range keys {
+		for _, f := range s.Found {
+			if f.Key == k {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // Refused is a file the dialog shows as not usable, and why. The name is the file's own: it is
@@ -169,20 +192,20 @@ func readHeader(f *os.File, size int64) (*gguf.Header, error) {
 }
 
 // checkPart opens, checks and closes one file; count is the set's size, or 1 for a file of its own.
-func checkPart(root, rel string, count int64) (int64, error) {
+func checkPart(root, rel string, count int64) (Stamp, error) {
 	f, st, err := openConfined(root, rel)
 	if err != nil {
-		return 0, err
+		return Stamp{}, err
 	}
 	defer f.Close()
 	h, err := readHeader(f, st.Size())
 	if err != nil {
-		return 0, err
+		return Stamp{}, err
 	}
 	if max(h.SplitCount, 1) != count {
-		return 0, errParts
+		return Stamp{}, errParts
 	}
-	return st.Size(), nil
+	return Stamp{Size: st.Size(), ModTime: st.ModTime()}, nil
 }
 
 // Scan looks through the model folder and one level of folders below it. It skips projectors,
@@ -275,12 +298,12 @@ func (m *Manager) Scan() Scan {
 		s.parts[no] = rel
 	}
 	for _, rel := range singles {
-		size, err := checkPart(root, rel, 1)
+		seen, err := checkPart(root, rel, 1)
 		if err != nil {
 			out.Refused = append(out.Refused, Refused{rel, reason(err)})
 			continue
 		}
-		out.Found = append(out.Found, Found{Key: rel, Files: []string{rel}, Size: size})
+		out.Found = append(out.Found, Found{Key: rel, Files: []string{rel}, Size: seen.Size, Seen: []Stamp{seen}})
 	}
 	for _, s := range sets {
 		var nos []int64
@@ -300,13 +323,14 @@ func (m *Manager) Scan() Scan {
 		f := Found{Key: first}
 		var bad error
 		for _, no := range nos {
-			size, err := checkPart(root, s.parts[no], s.total)
+			seen, err := checkPart(root, s.parts[no], s.total)
 			if err != nil {
 				bad = fmt.Errorf("part %d: %s", no, reason(err))
 				break
 			}
 			f.Files = append(f.Files, s.parts[no])
-			f.Size += size
+			f.Seen = append(f.Seen, seen)
+			f.Size += seen.Size
 		}
 		if bad != nil {
 			out.Refused = append(out.Refused, Refused{first, bad.Error()})
@@ -340,8 +364,10 @@ type ImportProgress func(file string, done, total int64)
 
 // Import adds the files the host chose in the agent's dialog. Only the agent's tray calls this.
 // It never holds the manager's lock while it hashes, so the link and the tray go on working, and
-// nothing is recorded until every part is hashed. A cancelled import leaves no trace.
-func (m *Manager) Import(ctx context.Context, keys []string, progress ImportProgress) []ImportResult {
+// nothing of a file or set is recorded until every part of it is hashed. A cancel stops the file in
+// progress and the ones after it: those finished before it stay added, and the results say which is which.
+// Each pick is what the dialog showed: a file that differs from it now, in size or modified time, is refused.
+func (m *Manager) Import(ctx context.Context, picks []Found, progress ImportProgress) []ImportResult {
 	if progress == nil {
 		progress = func(string, int64, int64) {}
 	}
@@ -365,13 +391,13 @@ func (m *Manager) Import(ctx context.Context, keys []string, progress ImportProg
 		offered[f.Key] = f
 	}
 	var total, base int64
-	for _, k := range keys {
-		total += offered[k].Size
+	for _, f := range picks {
+		total += f.Size
 	}
-	out := make([]ImportResult, 0, len(keys))
-	for _, k := range keys {
-		f, ok := offered[k]
-		if !ok {
+	out := make([]ImportResult, 0, len(picks))
+	for _, f := range picks {
+		k := f.Key
+		if now, ok := offered[k]; !ok || !slices.Equal(now.Files, f.Files) || len(f.Seen) != len(f.Files) {
 			out = append(out, ImportResult{Key: k, Err: "it can no longer be added"})
 			continue
 		}
@@ -382,7 +408,7 @@ func (m *Manager) Import(ctx context.Context, keys []string, progress ImportProg
 			if ctx.Err() != nil {
 				why = "cancelled"
 			} else if errors.Is(err, errImportStopped) {
-				why = err.Error()
+				why = strings.TrimPrefix(err.Error(), errImportStopped.Error()+": ")
 			}
 			m.log.Warn("import failed", "file", k, "why", why)
 			out = append(out, ImportResult{Key: k, Err: why})
@@ -402,8 +428,8 @@ func (m *Manager) importOne(ctx context.Context, root string, f Found, progress 
 	count := int64(len(f.Files))
 	files := make([]protocol.LocalFile, 0, count)
 	var done int64
-	for _, rel := range f.Files {
-		sum, size, err := m.hashPart(ctx, root, rel, count, func(n int64) { progress(rel, done+n) })
+	for i, rel := range f.Files {
+		sum, size, err := m.hashPart(ctx, root, rel, count, f.Seen[i], func(n int64) { progress(rel, done+n) })
 		if err != nil {
 			return "", err
 		}
@@ -438,7 +464,7 @@ func (m *Manager) importOne(ctx context.Context, root string, f Found, progress 
 	if old != nil {
 		if err := m.forget(old); err != nil {
 			m.mu.Unlock()
-			return "", stopped("the agent's protected records cannot be written")
+			return "", stopped("the agent's protected records cannot be read or written")
 		}
 	}
 	// The host's click is the approval: the same two records a download ends with.
@@ -450,7 +476,7 @@ func (m *Manager) importOne(ctx context.Context, root string, f Found, progress 
 		m.forget(e)
 		m.mu.Unlock()
 		m.log.Warn("an import could not be recorded", "err", err.Error())
-		return "", stopped("the agent's protected records cannot be written")
+		return "", stopped("the agent's protected records cannot be read or written")
 	}
 	m.index[e.ModelID] = e
 	m.saveLocked()
@@ -461,12 +487,15 @@ func (m *Manager) importOne(ctx context.Context, root string, f Found, progress 
 
 // hashPart checks one file again and hashes it through the same open handle, so what was checked is
 // what was hashed; a file that changed meanwhile is refused.
-func (m *Manager) hashPart(ctx context.Context, root, rel string, count int64, progress func(int64)) (string, int64, error) {
+func (m *Manager) hashPart(ctx context.Context, root, rel string, count int64, seen Stamp, progress func(int64)) (string, int64, error) {
 	f, st, err := openConfined(root, rel)
 	if err != nil {
 		return "", 0, err
 	}
 	defer f.Close()
+	if !seen.same(st) { // what the host approved is what the dialog showed
+		return "", 0, stopped("it changed after you chose it; choose it again")
+	}
 	h, err := readHeader(f, st.Size())
 	if err != nil {
 		return "", 0, err
@@ -610,7 +639,15 @@ func (m *Manager) forget(e *Entry) error {
 	for _, n := range e.Names {
 		names[n] = true
 	}
-	a := m.loadApprovals()
+	// Both are read before either is written: a failed read changes nothing.
+	a, err := m.loadApprovals()
+	if err != nil {
+		return err
+	}
+	rec, err := m.loadHashes()
+	if err != nil {
+		return err
+	}
 	kept := a.Allowed[:0]
 	for _, x := range a.Allowed {
 		if !(x.Repo == e.Repo && x.Commit == e.Commit && names[x.File]) {
@@ -625,7 +662,6 @@ func (m *Manager) forget(e *Entry) error {
 	if err := m.o.Store.WriteSecret(store.SecretApprovals, b); err != nil {
 		return err
 	}
-	rec := m.loadHashes()
 	for n := range names {
 		delete(rec, hashKey(e, n))
 	}

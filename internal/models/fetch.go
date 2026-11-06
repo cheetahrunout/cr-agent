@@ -491,20 +491,25 @@ type approval struct {
 	File   string `json:"file"`
 }
 
-func (m *Manager) loadApprovals() approvals {
+// loadApprovals returns the error of a read that failed: nothing may be written over records that
+// could not be read, or one bad read would wipe them. Only "not found" is an empty list.
+func (m *Manager) loadApprovals() (approvals, error) {
 	var a approvals
 	if m.o.Store == nil {
-		return a
+		return a, nil
 	}
 	b, err := m.o.Store.ReadSecret(store.SecretApprovals)
-	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			m.log.Warn("approvals unreadable; asking again", "err", err.Error())
-		}
-		return a
+	if errors.Is(err, store.ErrNotFound) {
+		return a, nil
 	}
-	_ = json.Unmarshal(b, &a)
-	return a
+	if err == nil {
+		err = json.Unmarshal(b, &a)
+	}
+	if err != nil {
+		m.log.Warn("the approvals cannot be read", "err", err.Error())
+		return approvals{}, err
+	}
+	return a, nil
 }
 
 // recordHashes keeps the SHA-256 of each finished download in DPAPI state (finding M3). The index sits
@@ -516,7 +521,10 @@ func (m *Manager) recordHashes(e *Entry) error {
 	}
 	m.secrets.Lock()
 	defer m.secrets.Unlock()
-	rec := m.loadHashes()
+	rec, err := m.loadHashes()
+	if err != nil {
+		return err
+	}
 	for _, f := range e.Files {
 		rec[hashKey(e, f.Path)] = f.SHA256
 	}
@@ -529,22 +537,24 @@ func (m *Manager) recordHashes(e *Entry) error {
 
 func hashKey(e *Entry, file string) string { return e.Repo + "@" + e.Commit + "/" + file }
 
-func (m *Manager) loadHashes() map[string]string {
+// loadHashes returns the error of a read that failed, for the reason loadApprovals does.
+func (m *Manager) loadHashes() (map[string]string, error) {
 	rec := map[string]string{}
 	if m.o.Store == nil {
-		return rec
+		return rec, nil
 	}
 	b, err := m.o.Store.ReadSecret(store.SecretModelHashes)
+	if errors.Is(err, store.ErrNotFound) {
+		return rec, nil
+	}
+	if err == nil {
+		err = json.Unmarshal(b, &rec)
+	}
 	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			m.log.Warn("the model hashes cannot be read; models must be downloaded again", "err", err.Error())
-		}
-		return rec
+		m.log.Warn("the model hashes cannot be read", "err", err.Error())
+		return nil, err
 	}
-	if json.Unmarshal(b, &rec) != nil {
-		return map[string]string{}
-	}
-	return rec
+	return rec, nil
 }
 
 // recorded reports whether every file of an entry is one this agent downloaded, with the hash the
@@ -553,7 +563,10 @@ func (m *Manager) recorded(e *Entry) bool {
 	if len(e.Files) == 0 {
 		return false
 	}
-	rec := m.loadHashes()
+	rec, err := m.loadHashes()
+	if err != nil {
+		return false
+	}
 	for _, f := range e.Files {
 		if rec[hashKey(e, f.Path)] != f.SHA256 {
 			return false
@@ -567,7 +580,11 @@ func (m *Manager) approved(repo, commit string, files []string) bool {
 	if len(files) == 0 {
 		return false
 	}
-	allowed := m.loadApprovals().Allowed
+	a, err := m.loadApprovals()
+	if err != nil {
+		return false
+	}
+	allowed := a.Allowed
 	for _, f := range files {
 		found := false
 		for _, x := range allowed {
@@ -591,7 +608,11 @@ func (m *Manager) trusted(e *Entry) bool {
 }
 
 func (m *Manager) repoAllowedBefore(repo string) bool {
-	for _, x := range m.loadApprovals().Allowed {
+	a, err := m.loadApprovals()
+	if err != nil {
+		return false
+	}
+	for _, x := range a.Allowed {
 		if x.Repo == repo {
 			return true
 		}
@@ -605,7 +626,10 @@ func (m *Manager) remember(repo, commit string, files []string) error {
 	}
 	m.secrets.Lock()
 	defer m.secrets.Unlock()
-	a := m.loadApprovals()
+	a, err := m.loadApprovals()
+	if err != nil {
+		return err
+	}
 	for _, f := range files {
 		a.Allowed = append(a.Allowed, approval{Repo: repo, Commit: commit, File: f})
 	}

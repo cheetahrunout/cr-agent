@@ -83,24 +83,19 @@ func shortCommit(c string) string {
 	return c
 }
 
-// clean makes a file name safe to show: no control or formatting characters (a right-to-left mark can
-// make one name read as another), and short enough for a dialog.
-func clean(name string) string {
-	var b strings.Builder
-	n := 0
-	for _, r := range name {
-		if n >= 80 {
-			b.WriteString("…")
-			break
-		}
+// safe makes a file name safe to show, at full length: no control or formatting characters (a
+// right-to-left mark can make one name read as another).
+func safe(name string) string {
+	return strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			r = '?'
+			return '?'
 		}
-		b.WriteRune(r)
-		n++
-	}
-	return b.String()
+		return r
+	}, name)
 }
+
+// clean is safe, shortened for a text that is not an approval. The end of the name stays.
+func clean(name string) string { return shorten(safe(name), 80) }
 
 // shorten keeps a name's start and end, where a model file says what it is: its quantization.
 func shorten(name string, width int) string {
@@ -119,9 +114,9 @@ const rowWidth = 28
 // after it shows every full name.
 func FoundRow(f models.Found) string {
 	if len(f.Files) > 1 {
-		return fmt.Sprintf("%s · %s (%d parts)", HumanSize(f.Size), shorten(clean(models.FileStem(f.Key)), rowWidth-10), len(f.Files))
+		return fmt.Sprintf("%s · %s (%d parts)", HumanSize(f.Size), shorten(safe(models.FileStem(f.Key)), rowWidth-10), len(f.Files))
 	}
-	return HumanSize(f.Size) + " · " + shorten(clean(f.Key), rowWidth)
+	return HumanSize(f.Size) + " · " + shorten(safe(f.Key), rowWidth)
 }
 
 // NothingToAddText is what the host reads when nothing can be added.
@@ -189,7 +184,7 @@ func ConfirmAddText(s models.Scan, keys []string) string {
 			if f.Key != k {
 				continue
 			}
-			b.WriteString(clean(f.Key) + " · " + HumanSize(f.Size))
+			b.WriteString(safe(f.Key) + " · " + HumanSize(f.Size))
 			if len(f.Files) > 1 {
 				fmt.Fprintf(&b, " · %d parts", len(f.Files))
 			}
@@ -205,9 +200,9 @@ func ImportResultText(results []models.ImportResult) string {
 	var added, failed []string
 	for _, r := range results {
 		if r.Err == "" {
-			added = append(added, clean(r.Key))
+			added = append(added, safe(r.Key))
 		} else {
-			failed = append(failed, clean(r.Key)+": "+r.Err)
+			failed = append(failed, safe(r.Key)+": "+r.Err)
 		}
 	}
 	var b strings.Builder

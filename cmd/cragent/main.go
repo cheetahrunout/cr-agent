@@ -803,13 +803,18 @@ func (ap *app) addModels() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p := ui.NewProgress(cancel)
-	results := ap.mm.Import(ctx, keys, p.Set)
-	finished := ctx.Err() == nil
-	p.Close()
-	ap.requestRefresh()
-	if finished {
-		ui.Info(ui.ImportResultText(results))
-	}
+	importAndTell(ctx, ap.mm, s.Picks(keys), p.Set, func() {
+		p.Close()
+		ap.requestRefresh()
+	}, ui.Info)
+}
+
+// importAndTell always tells the host what happened: a cancel keeps the files finished before it, so
+// even a cancelled import has something to say.
+func importAndTell(ctx context.Context, mm *models.Manager, picks []models.Found, progress models.ImportProgress, finished func(), tell func(string)) {
+	results := mm.Import(ctx, picks, progress)
+	finished()
+	tell(ui.ImportResultText(results))
 }
 
 // toggleSandbox is the host's own choice, on this PC, about running the engine outside its

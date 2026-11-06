@@ -1,8 +1,10 @@
 package models
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,6 +18,7 @@ import (
 	"github.com/cheetahrunout/cr-agent/internal/gguf/gguftest"
 	"github.com/cheetahrunout/cr-agent/internal/hf/hftest"
 	"github.com/cheetahrunout/cr-agent/internal/protocol"
+	"github.com/cheetahrunout/cr-agent/internal/store"
 )
 
 type countingTransport struct {
@@ -42,7 +45,39 @@ func (e *env) put(rel string, b []byte) string {
 
 func (e *env) add(keys ...string) []ImportResult {
 	e.t.Helper()
-	return e.m.Import(context.Background(), keys, nil)
+	return e.m.Import(context.Background(), e.pick(keys...), nil)
+}
+
+// pick is what the dialog hands over for these keys. A key the scan does not offer goes in bare, as a
+// caller naming something else would.
+func (e *env) pick(keys ...string) []Found {
+	e.t.Helper()
+	s := e.m.Scan()
+	out := s.Picks(keys)
+	for _, k := range keys {
+		if len(s.Picks([]string{k})) == 0 {
+			out = append(out, Found{Key: k, Files: []string{k}})
+		}
+	}
+	return out
+}
+
+func (e *env) allowed() []approval {
+	e.t.Helper()
+	a, err := e.m.loadApprovals()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return a.Allowed
+}
+
+func (e *env) hashes() map[string]string {
+	e.t.Helper()
+	h, err := e.m.loadHashes()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return h
 }
 
 func (e *env) addOK(key string) *protocol.LocalModel {
@@ -102,7 +137,7 @@ func TestStrangersFileGetsNothingBeforeTheClick(t *testing.T) {
 	if o := e.download(args("stranger-q4_k_m", repo, sha[:40], "Stranger-Q4_K_M.gguf")); o.Err == nil || o.Err.Code != protocol.ErrDenied {
 		t.Fatalf("download: %+v", o)
 	}
-	if len(e.m.Models()) != 0 || len(e.m.loadApprovals().Allowed) != 0 || len(e.m.loadHashes()) != 0 {
+	if len(e.m.Models()) != 0 || len(e.allowed()) != 0 || len(e.hashes()) != 0 {
 		t.Fatal("a refused command left something behind")
 	}
 	if n := e.hfCalls.Load(); n != 0 {
@@ -126,7 +161,7 @@ func TestImportEndsLikeADownload(t *testing.T) {
 	if e.changes.Load() == before {
 		t.Fatal("the hub was not told")
 	}
-	if !e.m.approved(lm.Repo, lm.Commit, []string{"Stranger-Q4_K_M.gguf"}) || e.m.loadHashes()[lm.Repo+"@"+lm.Commit+"/Stranger-Q4_K_M.gguf"] != sha {
+	if !e.m.approved(lm.Repo, lm.Commit, []string{"Stranger-Q4_K_M.gguf"}) || e.hashes()[lm.Repo+"@"+lm.Commit+"/Stranger-Q4_K_M.gguf"] != sha {
 		t.Fatal("the records are not there")
 	}
 	var hashed int
@@ -400,7 +435,7 @@ func TestDeleteOnlyForgets(t *testing.T) {
 	if b, err := os.ReadFile(p); err != nil || len(b) != len(e.model) {
 		t.Fatalf("the file went: %v", err)
 	}
-	if e.listed(lm.ModelID) != nil || e.m.approved(lm.Repo, lm.Commit, []string{"sub/keep.gguf"}) || len(e.m.loadHashes()) != 0 {
+	if e.listed(lm.ModelID) != nil || e.m.approved(lm.Repo, lm.Commit, []string{"sub/keep.gguf"}) || len(e.hashes()) != 0 {
 		t.Fatal("something was remembered")
 	}
 	if _, lerr := e.m.Resolve(lm.ModelID); lerr == nil {
@@ -501,7 +536,7 @@ func TestImportDoesNotBlockAndCancels(t *testing.T) {
 	e.m.testDuringImport = func() { close(entered); <-release }
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan []ImportResult, 1)
-	go func() { done <- e.m.Import(ctx, []string{"mine.gguf"}, nil) }()
+	go func() { done <- e.m.Import(ctx, e.pick("mine.gguf"), nil) }()
 	<-entered
 	free := make(chan struct{})
 	go func() {
@@ -519,7 +554,7 @@ func TestImportDoesNotBlockAndCancels(t *testing.T) {
 	if err := e.m.SetDir(t.TempDir()); err == nil {
 		t.Fatal("the folder changed during an import")
 	}
-	if r := e.m.Import(context.Background(), []string{"mine.gguf"}, nil); r[0].Err == "" {
+	if r := e.m.Import(context.Background(), e.pick("mine.gguf"), nil); r[0].Err == "" {
 		t.Fatal("two imports at once")
 	}
 	cancel()
@@ -527,13 +562,13 @@ func TestImportDoesNotBlockAndCancels(t *testing.T) {
 	if r := <-done; r[0].Err != "cancelled" {
 		t.Fatalf("result %+v", r)
 	}
-	if len(e.m.Models()) != 0 || len(e.m.loadApprovals().Allowed) != 0 || len(e.m.loadHashes()) != 0 {
+	if len(e.m.Models()) != 0 || len(e.allowed()) != 0 || len(e.hashes()) != 0 {
 		t.Fatal("a cancelled import left something")
 	}
 	// Progress reaches the total.
 	e.m.testDuringImport = nil
 	var last, total int64
-	r := e.m.Import(context.Background(), []string{"mine.gguf"}, func(_ string, d, n int64) { last, total = d, n })
+	r := e.m.Import(context.Background(), e.pick("mine.gguf"), func(_ string, d, n int64) { last, total = d, n })
 	if r[0].Err != "" || total != int64(len(e.model)) || last != total {
 		t.Fatalf("%+v progress %d of %d", r, last, total)
 	}
@@ -672,5 +707,262 @@ func TestImportNeedsTheStore(t *testing.T) {
 	}
 	if len(e.m.Models()) != 0 {
 		t.Fatal("listed")
+	}
+}
+
+// A cancel keeps what finished before it, and the results say so.
+func TestCancelKeepsWhatFinished(t *testing.T) {
+	e := newEnv(t)
+	other := append([]byte(nil), e.model...)
+	other[len(other)-1] ^= 1
+	e.put("a.gguf", e.model)
+	e.put("b.gguf", other)
+	e.put("c.gguf", other)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := e.m.Import(ctx, e.pick("a.gguf", "b.gguf", "c.gguf"), func(file string, _, _ int64) {
+		if file == "b.gguf" {
+			cancel()
+		}
+	})
+	if len(r) != 3 || r[0].Err != "" || r[0].ModelID != "a" || r[1].Err != "cancelled" || r[2].Err != "cancelled" {
+		t.Fatalf("results %+v", r)
+	}
+	if e.listed("a") == nil || len(e.m.Models()) != 1 {
+		t.Fatalf("listed %+v", e.m.Models())
+	}
+}
+
+// failingProtector fails the read of the named secrets.
+type failingProtector struct {
+	plain
+	fail map[string]bool
+}
+
+func (f *failingProtector) Unprotect(name string, b []byte) ([]byte, error) {
+	if f.fail[name] {
+		return nil, errors.New("DPAPI could not open the blob")
+	}
+	return f.plain.Unprotect(name, b)
+}
+
+// A failed read of the protected records changes nothing: an import or a delete during it refuses to
+// write, and what was recorded loads as before once the read works again.
+func TestFailedReadLosesNothing(t *testing.T) {
+	for _, failing := range [][]string{{store.SecretApprovals}, {store.SecretModelHashes}, {store.SecretApprovals, store.SecretModelHashes}} {
+		t.Run(strings.Join(failing, "+"), func(t *testing.T) {
+			e := newEnv(t)
+			e.ap.answer = true
+			if o := e.download(args("wiz", "wizard-org/Wizard-GGUF", commitA, "W-Q4_K_M.gguf")); o.Err != nil {
+				t.Fatal(o.Err)
+			}
+			e.put("mine.gguf", e.model)
+			mine := e.addOK("mine.gguf").ModelID
+			e.put("gone.gguf", e.model)
+			gone := e.addOK("gone.gguf").ModelID
+			other := append([]byte(nil), e.model...)
+			other[len(other)-1] ^= 1
+			e.put("second.gguf", other)
+			approvalsBefore, _ := e.st.ReadSecret(store.SecretApprovals)
+			hashesBefore, _ := e.st.ReadSecret(store.SecretModelHashes)
+
+			fp := &failingProtector{fail: map[string]bool{}}
+			st, err := store.OpenWith(e.st.Dir(), fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.m.o.Store = st
+			pick := e.pick("second.gguf")
+			for _, name := range failing {
+				fp.fail[name] = true
+			}
+			if r := e.m.Import(context.Background(), pick, nil); r[0].Err == "" {
+				t.Fatalf("imported while the records could not be read: %+v", r)
+			}
+			if _, lerr := e.m.Resolve(mine); lerr == nil {
+				t.Fatal("loaded while the records could not be read")
+			}
+			if derr := e.m.Delete(gone, false); derr != nil {
+				t.Fatal(derr)
+			}
+			if err := e.m.remember("wizard-org/x", commitA, []string{"x.gguf"}); (err == nil) == fp.fail[store.SecretApprovals] {
+				t.Errorf("remember: %v", err)
+			}
+			err = e.m.recordHashes(&Entry{Repo: "wizard-org/x", Commit: commitA, Files: []protocol.LocalFile{{Path: "x.gguf", SHA256: "a"}}})
+			if (err == nil) == fp.fail[store.SecretModelHashes] {
+				t.Errorf("recordHashes: %v", err)
+			}
+			clear(fp.fail)
+
+			// The blob of a record whose read failed is untouched, whatever was tried above.
+			for _, name := range failing {
+				want := approvalsBefore
+				if name == store.SecretModelHashes {
+					want = hashesBefore
+				}
+				if got, _ := e.st.ReadSecret(name); !bytes.Equal(got, want) {
+					t.Errorf("%s was written over: %s", name, got)
+				}
+			}
+			if _, lerr := e.m.Resolve("wiz"); lerr != nil {
+				t.Fatalf("the download after the failed read: %v", lerr)
+			}
+			if _, lerr := e.m.Resolve(mine); lerr != nil {
+				t.Fatalf("the added file after the failed read: %v", lerr)
+			}
+		})
+	}
+}
+
+// A damaged record is a failed read too, not an empty list.
+func TestDamagedRecordIsNotEmpty(t *testing.T) {
+	for _, name := range []string{store.SecretApprovals, store.SecretModelHashes} {
+		e2 := newEnv(t)
+		e2.put("mine.gguf", e2.model)
+		if err := e2.st.WriteSecret(name, []byte("not json")); err != nil {
+			t.Fatal(err)
+		}
+		if r := e2.add("mine.gguf"); r[0].Err == "" {
+			t.Fatalf("%s: imported over a damaged record", name)
+		}
+		if b, _ := e2.st.ReadSecret(name); string(b) != "not json" {
+			t.Fatalf("%s was written over: %s", name, b)
+		}
+	}
+}
+
+// What the host approved is what the dialog showed: a file that differs from it afterwards is refused.
+func TestChangedAfterTheDialog(t *testing.T) {
+	e := newEnv(t)
+	p := e.put("model.gguf", e.model)
+	f := gguftest.Default()
+	f.DataBytes = 512 << 10
+	bigger := gguftest.Build(f)
+
+	// Another size.
+	shown := e.m.Scan().Picks([]string{"model.gguf"})
+	os.WriteFile(p, bigger, 0o644)
+	r := e.m.Import(context.Background(), shown, nil)
+	if !strings.Contains(r[0].Err, "changed after you chose") || len(e.m.Models()) != 0 {
+		t.Fatalf("another size: %+v", r)
+	}
+	// The same size, another modified time: the same bytes for all the dialog can tell.
+	shown = e.m.Scan().Picks([]string{"model.gguf"})
+	later := time.Now().Add(time.Hour)
+	os.Chtimes(p, later, later)
+	r = e.m.Import(context.Background(), shown, nil)
+	if !strings.Contains(r[0].Err, "changed after you chose") || len(e.m.Models()) != 0 {
+		t.Fatalf("another time: %+v", r)
+	}
+	// A list of files other than the one offered now, with the right first name.
+	shown = e.m.Scan().Picks([]string{"model.gguf"})
+	shown[0].Files = append(shown[0].Files, "other.gguf")
+	if r = e.m.Import(context.Background(), shown, nil); r[0].Err == "" {
+		t.Fatalf("another list: %+v", r)
+	}
+	// Chosen again, it goes in, with the size it now has.
+	if lm := e.addOK("model.gguf"); *lm.SizeBytes != int64(len(bigger)) {
+		t.Fatalf("listed %+v", lm)
+	}
+}
+
+// A hard link that appears after the import, or after a download, stops the next load, also with the
+// hash already cached in this process.
+func TestSecondNameStopsTheLoad(t *testing.T) {
+	e := newEnv(t)
+	p := e.put("mine.gguf", e.model)
+	lm := e.addOK("mine.gguf")
+	if _, lerr := e.m.Resolve(lm.ModelID); lerr != nil {
+		t.Fatal(lerr)
+	}
+	outside := filepath.Join(t.TempDir(), "second-name.gguf")
+	if err := os.Link(p, outside); err != nil {
+		t.Skipf("no hard links here: %v", err)
+	}
+	_, lerr := e.m.Resolve(lm.ModelID)
+	if lerr == nil || lerr.Code != protocol.ErrDenied || !strings.Contains(lerr.Message, "hard link") {
+		t.Fatalf("load: %v", lerr)
+	}
+	if got := e.listed(lm.ModelID); got.State != StateChanged {
+		t.Fatalf("state %s", got.State)
+	}
+	// Removing the link and adding the file again is the way back.
+	os.Remove(outside)
+	if again := e.addOK("mine.gguf"); again.ModelID != lm.ModelID {
+		t.Fatalf("again %+v", again)
+	}
+	if _, lerr := e.m.Resolve(lm.ModelID); lerr != nil {
+		t.Fatal(lerr)
+	}
+
+	// A download, the same.
+	if o := e.download(args("tiny", "unsloth/Tiny-GGUF", commitA, "Tiny-Q4_K_M.gguf")); o.Err != nil {
+		t.Fatal(o.Err)
+	}
+	if _, lerr := e.m.Resolve("tiny"); lerr != nil {
+		t.Fatal(lerr)
+	}
+	if err := os.Link(tinyPath(e.root), filepath.Join(t.TempDir(), "tiny.gguf")); err != nil {
+		t.Fatal(err)
+	}
+	if _, lerr := e.m.Resolve("tiny"); lerr == nil || lerr.Code != protocol.ErrDenied {
+		t.Fatalf("a download with a second name: %v", lerr)
+	}
+}
+
+// The sweep touches only partial files where downloads write. The rest of the folder is the host's.
+func TestSweepLeavesTheHostsFiles(t *testing.T) {
+	e := newEnv(t)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	aged := func(rel string) string {
+		p := e.put(rel, []byte("half"))
+		os.Chtimes(p, old, old)
+		return p
+	}
+	commit := commitA[:12]
+	keep := []string{
+		aged("hosts-browser-download.gguf.part"),
+		aged("sub/also-the-hosts.gguf.part"),
+		aged("a/b/also-the-hosts.gguf.part"),
+		aged("a/b/not-a-commit/also-the-hosts.gguf.part"),
+		aged("a/b/" + commit + "/x/y/too-deep.gguf.part"),
+		aged("local-file/a/" + commit + "/reserved.gguf.part"),
+		aged("a/b/" + commit + "/not-a-partial.part"),
+	}
+	gone := []string{aged("a/b/" + commit + "/old.gguf.part"), aged("a/b/" + commit + "/sub/old.gguf.part")}
+	fresh := e.put("a/b/"+commit+"/resuming.gguf.part", []byte("half"))
+	keep = append(keep, fresh)
+
+	// Through what the agent really does: opening the folder.
+	if err := e.m.SetDir(e.root); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range keep {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("swept: %s", p)
+		}
+	}
+	for _, p := range gone {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("not swept: %s", p)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		return
+	}
+	// A junction is not followed, wherever it sits on the way.
+	outside := t.TempDir()
+	target := filepath.Join(outside, "b", commit, "outside.gguf.part")
+	os.MkdirAll(filepath.Dir(target), 0o755)
+	os.WriteFile(target, []byte("half"), 0o644)
+	os.Chtimes(target, old, old)
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", filepath.Join(e.root, "door"), outside).CombinedOutput(); err != nil {
+		t.Skipf("mklink failed: %v %s", err, out)
+	}
+	if err := e.m.SetDir(e.root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal("the sweep went through a junction")
 	}
 }

@@ -17,16 +17,22 @@ import (
 
 // proc is a child started suspended, placed in a Job Object, then resumed (ruling B15).
 type proc struct {
-	job    windows.Handle
-	handle windows.Handle
-	pid    uint32
-	out    *os.File // read end of the merged stdout/stderr pipe
+	job     windows.Handle
+	handle  windows.Handle
+	desktop uintptr // the child's own desktop, empty and never shown
+	pid     uint32
+	out     *os.File // read end of the merged stdout/stderr pipe
 
 	waitOnce sync.Once
 	done     chan struct{}
 	exitCode uint32
 	peak     uint64
 }
+
+const (
+	jobObjectBasicUIRestrictions = 4    // JobObjectBasicUIRestrictions
+	uiRestrictAll                = 0xFF // every JOB_OBJECT_UILIMIT_ flag
+)
 
 // spawnOptions controls how the child is started.
 type spawnOptions struct {
@@ -60,6 +66,15 @@ func spawn(o spawnOptions) (*proc, error) {
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
 		return nil, fmt.Errorf("SetInformationJobObject: %w", err)
+	}
+	// Every UI limit there is: no windows of others, no clipboard. Without this the sandbox can read window
+	// titles, and its answers leave through the relay. These limits do not stop a copy of the screen (BitBlt
+	// from the desktop's DC still works under them, measured), which is why the child also has a desktop of
+	// its own below. CUDA needs neither.
+	ui := windows.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: uiRestrictAll}
+	if _, err := windows.SetInformationJobObject(job, jobObjectBasicUIRestrictions,
+		uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui))); err != nil {
+		return nil, fmt.Errorf("%w: UI restrictions: %v", ErrSandboxUnavailable, err)
 	}
 
 	// Our own pipes: one merged stdout/stderr pipe, stdin from NUL. Only these two handles are
@@ -107,6 +122,16 @@ func spawn(o spawnOptions) (*proc, error) {
 	si.StdOutput = wr
 	si.StdErr = wr
 	si.ProcThreadAttributeList = attrs.List()
+	desktop, desktopName, err := privateDesktop()
+	if err != nil {
+		return nil, fmt.Errorf("%w: desktop: %v", ErrSandboxUnavailable, err)
+	}
+	defer func() {
+		if !ok {
+			closeDesktop(desktop)
+		}
+	}()
+	si.Desktop = desktopName
 
 	exe16, err := windows.UTF16PtrFromString(o.Exe)
 	if err != nil {
@@ -172,7 +197,7 @@ func spawn(o spawnOptions) (*proc, error) {
 	}
 	windows.CloseHandle(pi.Thread)
 	ok = true
-	p := &proc{job: job, handle: pi.Process, pid: pi.ProcessId, out: readEnd, done: make(chan struct{})}
+	p := &proc{job: job, handle: pi.Process, pid: pi.ProcessId, out: readEnd, desktop: desktop, done: make(chan struct{})}
 	go p.wait()
 	return p, nil
 }
@@ -202,6 +227,7 @@ func (p *proc) Kill() {
 		p.peak = p.jobPeak() // the job remembers its peak after the process is gone, until the handle closes
 		windows.CloseHandle(p.handle)
 		windows.CloseHandle(p.job) // KILL_ON_JOB_CLOSE: also the safety net if TerminateJobObject failed
+		closeDesktop(p.desktop)
 	})
 }
 

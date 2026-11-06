@@ -426,14 +426,7 @@ func (ap *app) start() error {
 			return err
 		}
 	}
-	if b, err := st.ReadSecret(store.SecretHFToken); err == nil {
-		ap.hfToken = string(b)
-	} else if !errors.Is(err, store.ErrNotFound) {
-		log.Warn("the stored Hugging Face token cannot be read", "err", err.Error())
-	}
-	if ap.hfToken == "" {
-		ap.hfToken = os.Getenv("HF_TOKEN") // the documented escape hatch (§12.1)
-	}
+	ap.hfToken = storedToken(st, log)
 	var err error
 	if ap.hf, err = hf.New(hf.Options{Base: o.hfBase, UserAgent: "cr-agent/" + version, Token: func() string {
 		ap.mu.Lock()
@@ -476,7 +469,7 @@ func (ap *app) start() error {
 	}
 
 	cfg := agent.Config{
-		Version: version, LlamaTag: llamaTag, SupportedArchs: enginelock.Pinned().Archs(), EngineDir: o.engine, ModelGrant: ap.modelGrant, MemLimit: memCap, LogicalCores: sys.Logical,
+		Version: version, LlamaTag: llamaTag, SupportedArchs: enginelock.Pinned().Archs(), EngineDir: o.engine, ModelGrant: ap.modelGrant, ModelGranted: ap.recordGrant, ModelFolderCheck: ap.modelFolderCheck, MemLimit: memCap, LogicalCores: sys.Logical,
 		Log: log, Models: ap.mm, Store: st,
 		Hardware: func(ctx context.Context) protocol.Hardware {
 			h, err := hw.Report(ctx, ap.mm.Dir())
@@ -551,6 +544,11 @@ func (ap *app) start() error {
 		cfg.Updater, cfg.RolledBack, cfg.EngineCheck = up, up.RolledBack, up.VerifyEngine
 		cfg.Restart = func() { ap.exit(layout.ExitRestart) }
 		cfg.EngineDir = layout.EngineDir(ap.root, llamaTag)
+	}
+	// Whatever a model left in the container's profile between loads goes now, before any engine runs.
+	supervisor.ScopeContainer(st.Dir())
+	if err := supervisor.ResetSandbox(); err != nil {
+		log.Warn("the engine's sandbox could not be reset", "err", err.Error())
 	}
 	ap.a = agent.New(cfg)
 	ap.aRef.Store(ap.a)
@@ -777,20 +775,70 @@ func lowIntegrityQuestion() string {
 		"Allow this only if you trust the models you load.\n\nRun the engine at low integrity on this PC?"
 }
 
-// modelGrant is the model folder the agent may let the sandbox read at a load: its own, or the one the
-// host allowed by a click in this agent. It changes the permissions of no other folder.
+// modelGrant is the model folder the agent may let the sandbox read at a load: <home>\models, or the one
+// the host allowed by a click in this agent, if it may still be used. It changes the permissions of no other folder.
 func (ap *app) modelGrant() string {
 	dir := ap.mm.Dir()
-	if underFolder(dir, ap.st.Dir()) || strings.EqualFold(ap.st.Config().EngineReadFolder, dir) {
+	if ap.modelFolderCheck() != nil {
+		return ""
+	}
+	if supervisor.IsOwnModelFolder(dir, ap.st.Dir()) || strings.EqualFold(ap.st.Config().EngineReadFolder, dir) {
 		return dir
 	}
 	return ""
 }
 
-// underFolder reports whether dir is parent or below it.
-func underFolder(dir, parent string) bool {
-	rel, err := filepath.Rel(parent, dir)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+func (ap *app) modelFolderCheck() error { return supervisor.CheckModelFolder(ap.mm.Dir(), ap.st.Dir()) }
+
+// storedToken is the Hugging Face token the host stored through the tray. There is no other way in: the
+// sandbox can read HKCU\Environment, so a token in an environment variable would be open to a model.
+func storedToken(st *store.Store, log *slog.Logger) string {
+	b, err := st.ReadSecret(store.SecretHFToken)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			log.Warn("the stored Hugging Face token cannot be read", "err", err.Error())
+		}
+		return ""
+	}
+	return string(b)
+}
+
+func (ap *app) recordGrant(path string) {
+	if err := recordGrant(ap.st, path); err != nil {
+		ap.log.Warn("a read entry could not be recorded", "err", err.Error())
+	}
+}
+
+// recordGrant remembers a path the agent itself added the sandbox's read entry to.
+func recordGrant(st *store.Store, path string) error {
+	return st.Update(func(c *store.Config) {
+		for _, p := range c.EngineGrants {
+			if strings.EqualFold(p, path) {
+				return
+			}
+		}
+		c.EngineGrants = append(c.EngineGrants, path)
+	})
+}
+
+// revokeGrants takes away the read entries the agent added in a folder it no longer uses. An entry it
+// did not add is not in the record, so a host's own is never touched.
+func revokeGrants(st *store.Store, dir string, log *slog.Logger) {
+	clean := strings.ToLower(filepath.Clean(dir))
+	var keep []string
+	for _, p := range st.Config().EngineGrants {
+		cp := strings.ToLower(filepath.Clean(p))
+		if cp != clean && !strings.HasPrefix(cp, clean+string(filepath.Separator)) {
+			keep = append(keep, p)
+			continue
+		}
+		if err := supervisor.RevokeModelGrant(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Warn("a read entry could not be taken away", "err", err.Error())
+		}
+	}
+	if err := st.Update(func(c *store.Config) { c.EngineGrants = keep }); err != nil {
+		log.Warn("the read entries could not be recorded", "err", err.Error())
+	}
 }
 
 func modelFolderQuestion(dir string) string {
@@ -803,6 +851,10 @@ func modelFolderQuestion(dir string) string {
 // add. It offers no button and starts nothing: the tray's Add model files… is the only way in.
 func (ap *app) noticeModelFiles() {
 	if ap.mm == nil {
+		return
+	}
+	if ap.modelFolderCheck() != nil {
+		ap.tr.Notify("Your model folder cannot be used", "It holds more than models. Make a subfolder just for models, and choose it under Model folder in the tray menu.")
 		return
 	}
 	// An earlier version had no sandbox to ask for: a folder the host chose then needs this one click.
@@ -929,20 +981,30 @@ func (ap *app) setFolder() {
 		ui.Error("A model is loaded. Unload it in the hub (or pause hosting) before changing the model folder.")
 		return
 	}
+	if err := supervisor.CheckModelFolder(dir, ap.st.Dir()); err != nil {
+		ui.Error(err.Error())
+		return
+	}
 	// The engine's sandbox can read a folder only if the folder says so, and this one is the host's.
-	own := underFolder(dir, ap.st.Dir())
+	own := supervisor.IsOwnModelFolder(dir, ap.st.Dir())
 	readable := own || supervisor.CanEngineRead(dir)
+	added := false
 	if !readable && ap.engineSandboxed() {
 		if !ui.Confirm(modelFolderQuestion(dir), "Allow") {
 			return
 		}
-		if err := supervisor.GrantModelFolder(dir); err != nil {
+		var err error
+		if added, err = supervisor.GrantModelFolder(dir); err != nil {
 			ui.Error("The engine cannot be allowed to read that folder: " + err.Error() + ".")
 			return
 		}
 		readable = true
 	}
+	old := ap.mm.Dir()
 	if err := ap.mm.SetDir(dir); err != nil {
+		if added {
+			_ = supervisor.RevokeModelGrant(dir)
+		}
 		ui.Error("That folder cannot be used: " + err.Error() + ".")
 		return
 	}
@@ -954,6 +1016,12 @@ func (ap *app) setFolder() {
 		}
 	}); err != nil {
 		ap.log.Warn("model folder not saved", "err", err.Error())
+	}
+	if added {
+		ap.recordGrant(dir)
+	}
+	if !strings.EqualFold(filepath.Clean(old), filepath.Clean(ap.mm.Dir())) {
+		revokeGrants(ap.st, old, ap.log)
 	}
 	ap.log.Info("model folder changed", "models_dir", ap.mm.Dir())
 	ap.requestRefresh()

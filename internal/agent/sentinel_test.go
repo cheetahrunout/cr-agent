@@ -20,6 +20,7 @@ import (
 
 	"github.com/cheetahrunout/cr-agent/internal/hw"
 	"github.com/cheetahrunout/cr-agent/internal/link"
+	"github.com/cheetahrunout/cr-agent/internal/supervisor"
 )
 
 // syncBuffer is the agent log of the sentinel test.
@@ -60,6 +61,8 @@ func TestSentinelNotInAgentLog(t *testing.T) {
 
 	// The sandbox reads only a folder it was granted, and this test changes no permissions on the real model.
 	folder := t.TempDir()
+	supervisor.ScopeContainer(folder) // its own container, and none left behind
+	t.Cleanup(func() { supervisor.DeleteContainer() })
 	copied := filepath.Join(folder, filepath.Base(model))
 	in, err := os.Open(model)
 	if err != nil {

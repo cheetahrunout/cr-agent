@@ -104,21 +104,28 @@ func TestCheckThatCannotRunKeepsTheSandbox(t *testing.T) {
 }
 
 // A sandbox that cannot be set up is an engine error and never a start with weaker isolation (ruling
-// B63). No hub or model can cause it, so it does raise the host's own offer.
+// B63). A model can cause it, so the offer goes up only on the agent's own probe.
 func TestSandboxUnavailableIsAnEngineError(t *testing.T) {
 	var runs []bool
-	a := New(Config{Version: "0.1.0", Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
-		runs = append(runs, c.Level == supervisor.LevelAppContainer)
-		if c.Level == supervisor.LevelAppContainer {
-			return nil, fmt.Errorf("%w: CreateAppContainerProfile failed", supervisor.ErrSandboxUnavailable)
-		}
-		return &bareEngine{done: make(chan struct{})}, nil
-	}})
+	found := true
+	a := New(Config{Version: "0.1.0", ProbeCUDA: func() (bool, error) { return found, nil },
+		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
+			runs = append(runs, c.Level == supervisor.LevelAppContainer)
+			if c.Level == supervisor.LevelAppContainer {
+				return nil, fmt.Errorf("%w: no Unix socket here", supervisor.ErrSandboxUnavailable)
+			}
+			return &bareEngine{done: make(chan struct{})}, nil
+		}})
 	defer a.Shutdown()
 	_, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
 	if !errors.Is(err, supervisor.ErrSandboxUnavailable) || len(runs) != 1 || !runs[0] {
 		t.Fatalf("runs %v err %v", runs, err)
 	}
+	if a.SandboxBlocked() {
+		t.Fatal("offered with a GPU the probe can see: a model can cause this failure")
+	}
+	found = false
+	a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0))
 	if !a.SandboxBlocked() {
 		t.Fatal("the host was not offered the way out")
 	}
@@ -127,25 +134,53 @@ func TestSandboxUnavailableIsAnEngineError(t *testing.T) {
 	if a.Level() != supervisor.LevelLowIntegrity {
 		t.Fatal("still in the AppContainer after the host's choice")
 	}
-	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0)); err != nil || len(runs) != 2 || runs[1] {
+	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0)); err != nil || len(runs) != 3 || runs[2] {
 		t.Fatalf("after the opt-in: runs %v err %v", runs, err)
+	}
+}
+
+// A stored folder that may no longer be used is an engine error of its own: nothing starts, nothing is
+// granted, and neither the path nor the reason reaches the hub.
+func TestRefusedFolderIsAnEngineError(t *testing.T) {
+	w := newWorldWith(t, func(c *Config) {
+		c.ModelFolderCheck = func() error { return errors.New(`C:\\Users\\secret holds more than models`) }
+	})
+	h, _ := w.connect()
+	w.a.cfg.LocalModelID, w.a.cfg.LocalModelPath = "smollm2-360m-q8_0", "local.gguf"
+	h.send(loadOK)
+	var engineErr any
+	e := h.until("the refusal", 5*time.Second, func(m map[string]any) bool {
+		if m["t"] == "status" && m["engine_error"] != nil {
+			engineErr = m["engine_error"]
+		}
+		return m["t"] == "cmd.err"
+	})
+	msg, _ := e["message"].(string)
+	if e["code"] != "engine_failed" || !strings.Contains(msg, EngineFolderRefused) || strings.Contains(msg, "secret") || engineErr != EngineFolderRefused {
+		t.Fatalf("cmd.err %v, status engine_error %v", e, engineErr)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.started) != 0 {
+		t.Fatalf("%d starts", len(w.started))
 	}
 }
 
 // The folder the agent may grant reaches the engine's start.
 func TestModelGrantReachesTheEngine(t *testing.T) {
-	var got string
-	a := New(Config{Version: "0.1.0", ModelGrant: func() string { return `C:\own\models` },
+	var got, recorded string
+	a := New(Config{Version: "0.1.0", ModelGrant: func() string { return `C:\own\models` }, ModelGranted: func(p string) { recorded = p },
 		Start: func(ctx context.Context, c supervisor.Config) (Engine, error) {
 			got = c.ModelGrant
+			c.OnGrant(`C:\own\models`) // what Start does for an entry it added
 			return &bareEngine{done: make(chan struct{})}, nil
 		}})
 	defer a.Shutdown()
 	if _, err := a.Load(context.Background(), "m", "x.gguf", sandboxSettings(0)); err != nil {
 		t.Fatal(err)
 	}
-	if got != `C:\own\models` {
-		t.Fatalf("got %q", got)
+	if got != `C:\own\models` || recorded != got {
+		t.Fatalf("got %q, recorded %q", got, recorded)
 	}
 }
 

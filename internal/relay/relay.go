@@ -64,14 +64,16 @@ type flight struct {
 
 var errCancelled = errors.New("cancelled by the hub")
 
-// New returns a relay with a client that never uses a proxy and never times out a stream.
+// New returns a relay with a client that never uses a proxy and never times out a stream, and takes a
+// new connection for each request. Over the sandbox's Unix socket a kept-alive connection sometimes never
+// answers its second request (measured: about 1 in 50, while a new connection answers at once).
 func New(target Target, log *slog.Logger) *Relay {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Relay{
 		Target: target,
-		Client: &http.Client{Transport: &http.Transport{Proxy: nil, DisableCompression: true, MaxIdleConns: 4, IdleConnTimeout: 30 * time.Second, DialContext: supervisor.DialEngine}},
+		Client: &http.Client{Transport: &http.Transport{Proxy: nil, DisableCompression: true, DisableKeepAlives: true, DialContext: supervisor.DialEngine}},
 		Log:    log,
 	}
 }

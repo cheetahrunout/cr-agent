@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -143,6 +144,8 @@ func TestImportRealEngine(t *testing.T) {
 
 func realImport(t *testing.T, engineDir, model string, level supervisor.Level) {
 	home := t.TempDir()
+	supervisor.ScopeContainer(home) // its own container, and none left behind
+	t.Cleanup(func() { supervisor.DeleteContainer() })
 	st, err := store.Open(home)
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +251,39 @@ func realImport(t *testing.T, engineDir, model string, level supervisor.Level) {
 		t.Fatalf("level %v reached at %s", level, base)
 	}
 	t.Logf("level %v, reached at %s", level, base)
+
+	// With the UI restrictions on: an answer, a stream, a cancel in mid-stream, and an answer after it.
+	chat := func(rid string, stream bool, tokens int) {
+		h.send(fmt.Sprintf(`{"v":1,"t":"req","id":%q,"path":"/v1/chat/completions","stream":%v,"body":{"messages":[{"role":"user","content":"Write a long story about a fox."}],"max_tokens":%d,"stream":%v}}`, rid, stream, tokens, stream))
+	}
+	answer := func(rid string) (status float64, payloads int) {
+		h.until("res.end of "+rid, 2*time.Minute, func(m map[string]any) bool {
+			switch {
+			case m["id"] != rid:
+			case m["t"] == "res.head":
+				status = m["status"].(float64)
+			case m["t"] == "res.data":
+				payloads += len(m["d"].([]any))
+			case m["t"] == "res.end":
+				return true
+			}
+			return false
+		})
+		return
+	}
+	if status, n := answer(func() string { chat("r-01JCKZ3Q9X8YB7N6M5P4R3S2A1", true, 32); return "r-01JCKZ3Q9X8YB7N6M5P4R3S2A1" }()); status != 200 || n == 0 {
+		t.Fatalf("stream: status %v, %d payloads", status, n)
+	}
+	const cancelled = "r-01JCKZ3Q9X8YB7N6M5P4R3S2A2"
+	chat(cancelled, true, 4000)
+	h.until("first data", time.Minute, func(m map[string]any) bool { return m["id"] == cancelled && m["t"] == "res.data" })
+	cancelAt := time.Now()
+	h.send(`{"v":1,"t":"cancel","id":"` + cancelled + `"}`)
+	end := h.until("the cancel", 30*time.Second, func(m map[string]any) bool { return m["id"] == cancelled && m["t"] == "res.end" })
+	t.Logf("cancel: %v in %v", end["reason"], time.Since(cancelAt).Round(time.Millisecond))
+	if status, n := answer(func() string { chat("r-01JCKZ3Q9X8YB7N6M5P4R3S2A3", false, 8); return "r-01JCKZ3Q9X8YB7N6M5P4R3S2A3" }()); status != 200 || n == 0 {
+		t.Fatalf("after the cancel: status %v, %d payloads", status, n)
+	}
 	h.send(cmdLine("C3", "unload", ""))
 	h.until("unload", time.Minute, isFor("C3"))
 	h.send(cmdLine("C4", "delete", `"model_id":"`+lm.ModelID+`"`))

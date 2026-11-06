@@ -27,10 +27,13 @@ type Config struct {
 	ModelsDir string `json:"models_dir,omitempty"` // empty = <home>\models
 	// EngineReadFolder is the model folder the host allowed the engine's sandbox to read, by a click.
 	EngineReadFolder string `json:"engine_read_folder,omitempty"`
-	LocalPause       bool   `json:"local_pause,omitempty"`
-	KeepAwake        bool   `json:"keep_awake,omitempty"`
-	IdleUnloadMin    int    `json:"idle_unload_min,omitempty"`
-	GPUSelect        string `json:"gpu_select,omitempty"`
+	// EngineGrants lists the paths the agent itself added the sandbox's read entry to, so that it can
+	// take those away and never touches an entry the host made.
+	EngineGrants  []string `json:"engine_grants,omitempty"`
+	LocalPause    bool     `json:"local_pause,omitempty"`
+	KeepAwake     bool     `json:"keep_awake,omitempty"`
+	IdleUnloadMin int      `json:"idle_unload_min,omitempty"`
+	GPUSelect     string   `json:"gpu_select,omitempty"`
 	// EngineLowIntegrity is the host's own click in the tray: the AppContainer does not work on this PC,
 	// and the host chose low integrity instead. The hub cannot set it. There is no setting below it: an older
 	// version's engine_normal_integrity is not read, and that host starts again from the AppContainer.

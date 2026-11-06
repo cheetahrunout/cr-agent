@@ -11,8 +11,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -92,7 +95,19 @@ func TestMain(m *testing.M) {
 		sandboxChild(os.Args[i+1:])
 		return
 	}
-	os.Exit(m.Run())
+	if i := indexOf(os.Args, "--sabotage-child"); i >= 0 {
+		sabotageChild(os.Args[i+1])
+		return
+	}
+	if i := indexOf(os.Args, "--ui-child"); i >= 0 {
+		uiChild(os.Args[i+1])
+		return
+	}
+	// These tests reset the profile, so they use one of their own, and leave none behind.
+	setContainerName(fmt.Sprintf("%s-test-%d", containerName, os.Getpid()))
+	code := m.Run()
+	DeleteContainer()
+	os.Exit(code)
 }
 
 func indexOf(s []string, v string) int {
@@ -143,7 +158,7 @@ func boundary(t *testing.T, level Level, want map[string]string) {
 	blob := filepath.Join(private, "secret.blob")
 	os.WriteFile(blob, unsafe2bytes(out), 0o644)
 
-	if err := prepareSandbox(engineDir, modelDir, model); err != nil {
+	if err := prepareSandbox(engineDir, modelDir, model, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !CanEngineRead(modelDir) || CanEngineRead(private) {
@@ -248,7 +263,7 @@ func TestPrepareModelFindsAMovedFile(t *testing.T) {
 	folder, elsewhere := t.TempDir(), t.TempDir()
 	first := filepath.Join(folder, "a.gguf")
 	os.WriteFile(first, []byte("x"), 0o644)
-	if err := prepareModel(folder, first); err != nil {
+	if err := prepareModel(folder, first, nil); err != nil {
 		t.Fatal(err)
 	}
 	src := filepath.Join(elsewhere, "moved.gguf")
@@ -264,7 +279,7 @@ func TestPrepareModelFindsAMovedFile(t *testing.T) {
 	if ok, _ := allowsRead(moved, sid); ok {
 		t.Skip("this file system gave the moved file the folder's entry by itself")
 	}
-	if err := prepareModel(folder, moved); err != nil {
+	if err := prepareModel(folder, moved, nil); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := allowsRead(moved, sid); !ok || err != nil {
@@ -272,7 +287,7 @@ func TestPrepareModelFindsAMovedFile(t *testing.T) {
 	}
 	// No folder to grant: nothing is changed.
 	other := t.TempDir()
-	if err := prepareModel("", filepath.Join(other, "x.gguf")); err != nil {
+	if err := prepareModel("", filepath.Join(other, "x.gguf"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if CanEngineRead(other) {
@@ -286,7 +301,7 @@ func TestGrantsAreForAllPackages(t *testing.T) {
 	engine, models := t.TempDir(), t.TempDir()
 	file := filepath.Join(models, "m.gguf")
 	os.WriteFile(file, []byte("x"), 0o644)
-	if err := prepareSandbox(engine, models, file); err != nil {
+	if err := prepareSandbox(engine, models, file, nil); err != nil {
 		t.Fatal(err)
 	}
 	own, err := engineContainer()
@@ -372,7 +387,7 @@ func TestRealEngineModelOnAnotherDrive(t *testing.T) {
 	if _, err := Start(context.Background(), cfg); !errors.Is(err, ErrEngineExited) {
 		t.Fatalf("without the grant: %v", err)
 	}
-	if err := GrantModelFolder(folder); err != nil {
+	if _, err := GrantModelFolder(folder); err != nil {
 		t.Fatal(err)
 	}
 	e, err := Start(context.Background(), cfg)
@@ -409,5 +424,421 @@ func TestStartInSandboxNeedsTheSandbox(t *testing.T) {
 	socketsMu.Unlock()
 	if n != 0 {
 		t.Fatalf("%d sockets left registered", n)
+	}
+}
+
+// What a model can do inside the container: take the socket's folder away and leave a file in its place.
+func sabotageChild(temp string) {
+	fmt.Println("rename:", os.Rename(temp, filepath.Join(filepath.Dir(temp), "Temp.gone")))
+	fmt.Println("file:", os.WriteFile(temp, []byte("x"), 0o644))
+}
+
+// startChild runs this test binary at a level, with the given flag, and returns what it printed.
+func startChild(t *testing.T, level Level, args ...string) string {
+	t.Helper()
+	engineDir := t.TempDir()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(engineDir, "child.exe")
+	if err := os.WriteFile(exe, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareSandbox(engineDir, "", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	p, err := spawn(spawnOptions{Exe: exe, Args: args, Dir: engineDir, Level: level})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Kill()
+	defer p.out.Close()
+	out, _ := io.ReadAll(p.out)
+	return string(out)
+}
+
+// A model cannot break the sandbox for later loads: the next start makes the profile anew, with the same SID.
+func TestModelCannotBreakTheSandbox(t *testing.T) {
+	sid, err := engineContainer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := sid.String()
+	temp, err := containerTemp(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := startChild(t, LevelAppContainer, "--sabotage-child", temp)
+	if !strings.Contains(out, "rename: <nil>") || !strings.Contains(out, "file: <nil>") {
+		t.Skipf("the container could not do it here: %s", out)
+	}
+	if st, err := os.Stat(temp); err != nil || st.IsDir() {
+		t.Fatalf("the sabotage did not take: %v", err)
+	}
+	p, err := newSocketPath()
+	if err != nil {
+		t.Fatalf("the sandbox stayed broken: %v", err)
+	}
+	if st, err := os.Stat(temp); err != nil || !st.IsDir() {
+		t.Fatalf("Temp after the reset: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(temp), "Temp.gone")); err == nil {
+		t.Fatal("what the model left is still there")
+	}
+	after, err := engineContainer()
+	if err != nil || after.String() != before {
+		t.Fatalf("SID %v, was %s: %v", after, before, err)
+	}
+	l, err := net.Listen("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+}
+
+// A link in the socket's place is not followed: the agent writes nothing through it.
+func TestSocketIsNotMadeThroughALink(t *testing.T) {
+	sid, err := engineContainer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp, _ := containerTemp(sid)
+	if err := os.Remove(temp); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", temp, outside).CombinedOutput(); err != nil {
+		t.Skipf("mklink failed: %v %s", err, out)
+	}
+	if _, err := trySocketPath(); err == nil {
+		t.Fatal("a socket path through a link was accepted")
+	}
+	p, err := newSocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(p, outside) {
+		t.Fatalf("socket %s", p)
+	}
+	if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+		t.Fatalf("written through the link: %v", ents)
+	}
+}
+
+// The reset at each agent start clears whatever a model left between loads.
+func TestResetClearsTheProfile(t *testing.T) {
+	sid, err := engineContainer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp, _ := containerTemp(sid)
+	planted := filepath.Join(temp, "planted.bin")
+	if err := os.WriteFile(planted, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResetSandbox(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(planted); err == nil {
+		t.Fatal("still there after the reset")
+	}
+	if _, err := newSocketPath(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Each agent folder has its own container, so a reset cannot reach another agent's engine.
+func TestContainersAreScopedByFolder(t *testing.T) {
+	saved := currentContainer
+	defer setContainerName(saved)
+	ScopeContainer(`C:\\one`)
+	a := currentContainer
+	ScopeContainer(`C:\\ONE`)
+	b := currentContainer
+	ScopeContainer(`C:\\two`)
+	if a != b || a == currentContainer || !strings.HasPrefix(a, containerName+"-") {
+		t.Fatalf("%q %q %q", a, b, currentContainer)
+	}
+}
+
+// uiProbe is what a process can see of the desktop: the titled windows of other processes, how many colours
+// a copy of the screen holds (one means it got nothing), and whether it can open the clipboard.
+func uiProbe(atomName string) (others, colours int, clipboard, atom bool) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	u := windows.NewLazySystemDLL("user32.dll")
+	g := windows.NewLazySystemDLL("gdi32.dll")
+	self := windows.GetCurrentProcessId()
+	cb := syscall.NewCallback(func(h, _ uintptr) uintptr {
+		var pid uint32
+		u.NewProc("GetWindowThreadProcessId").Call(h, uintptr(unsafe.Pointer(&pid)))
+		b := make([]uint16, 200)
+		if n, _, _ := u.NewProc("GetWindowTextW").Call(h, uintptr(unsafe.Pointer(&b[0])), 200); n > 0 && pid != self {
+			others++
+		}
+		return 1
+	})
+	u.NewProc("EnumWindows").Call(cb, 0)
+	seen := map[uintptr]bool{}
+	if dc, _, _ := u.NewProc("GetDC").Call(0); dc != 0 {
+		w, _, _ := u.NewProc("GetSystemMetrics").Call(0)
+		hh, _, _ := u.NewProc("GetSystemMetrics").Call(1)
+		if w == 0 || hh == 0 {
+			w, hh = 256, 256
+		}
+		mem, _, _ := g.NewProc("CreateCompatibleDC").Call(dc)
+		bm, _, _ := g.NewProc("CreateCompatibleBitmap").Call(dc, w, hh)
+		g.NewProc("SelectObject").Call(mem, bm)
+		if ok, _, _ := g.NewProc("BitBlt").Call(mem, 0, 0, w, hh, dc, 0, 0, 0x00CC0020); ok != 0 {
+			for x := uintptr(0); x < w; x += w/40 + 1 {
+				for y := uintptr(0); y < hh; y += hh/40 + 1 {
+					c, _, _ := g.NewProc("GetPixel").Call(mem, x, y)
+					seen[c] = true
+				}
+			}
+		}
+	}
+	if ok, _, _ := u.NewProc("OpenClipboard").Call(0); ok != 0 {
+		clipboard = true
+		u.NewProc("CloseClipboard").Call()
+	}
+	// The session's global atoms: only the job's limits give the child a table of its own.
+	if atomName != "" {
+		name, _ := windows.UTF16PtrFromString(atomName)
+		a, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalFindAtomW").Call(uintptr(unsafe.Pointer(name)))
+		atom = a != 0
+	}
+	return others, len(seen), clipboard, atom
+}
+
+func uiChild(atomName string) {
+	others, colours, clip, atom := uiProbe(atomName)
+	fmt.Printf("others=%d colours=%d clipboard=%v atom=%v\n", others, colours, clip, atom)
+}
+
+// The screen, other windows' titles and the clipboard are closed at both levels.
+func TestSandboxCannotSeeTheDesktop(t *testing.T) {
+	others, colours, _, _ := uiProbe("")
+	t.Logf("this test itself: others=%d colours=%d", others, colours)
+	atomName := fmt.Sprintf("cr-agent-test-atom-%d", os.Getpid())
+	name, _ := windows.UTF16PtrFromString(atomName)
+	kernel := windows.NewLazySystemDLL("kernel32.dll")
+	added, _, _ := kernel.NewProc("GlobalAddAtomW").Call(uintptr(unsafe.Pointer(name)))
+	if added == 0 {
+		t.Fatal("no global atom")
+	}
+	defer kernel.NewProc("GlobalDeleteAtom").Call(added)
+	for _, level := range []Level{LevelAppContainer, LevelLowIntegrity} {
+		out := strings.TrimSpace(startChild(t, level, "--ui-child", atomName))
+		t.Logf("%v: %s", level, out)
+		var o, c int
+		var clip, atom bool
+		if _, err := fmt.Sscanf(out, "others=%d colours=%d clipboard=%v atom=%v", &o, &c, &clip, &atom); err != nil {
+			t.Fatalf("%v: %q: %v", level, out, err)
+		}
+		if o != 0 {
+			t.Errorf("%v: sees %d windows of other processes", level, o)
+		}
+		if c > 1 {
+			t.Errorf("%v: a copy of the screen holds %d colours", level, c)
+		}
+		if clip {
+			t.Errorf("%v: can open the clipboard", level)
+		}
+		if atom {
+			t.Errorf("%v: finds a global atom of this session: the job's UI limits are off", level)
+		}
+	}
+	if others == 0 || colours <= 1 {
+		t.Log("this session has no desktop to see, so this run proves little")
+	}
+}
+
+// A forgotten engine host is never dialled out: a prompt must not reach whatever answers to that name.
+func TestForgottenEngineIsNeverLookedUp(t *testing.T) {
+	base := registerSocket("gone.sock")
+	host := strings.TrimPrefix(base, "http://") + ":80"
+	forgetSocket("gone.sock")
+	for _, addr := range []string{host, strings.ToUpper(host), "cr-engine-anything:80"} {
+		if _, err := DialEngine(context.Background(), "tcp", addr); !errors.Is(err, ErrEngineGone) {
+			t.Errorf("%s: %v", addr, err)
+		}
+	}
+	// Any other address is dialled as it was.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	c, err := DialEngine(context.Background(), "tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+func known(t *testing.T, id *windows.KNOWNFOLDERID) string {
+	t.Helper()
+	p, err := windows.KnownFolderPath(id, 0)
+	if err != nil {
+		t.Skipf("no such known folder here: %v", err)
+	}
+	return p
+}
+
+// Refused: the agent's folder but for models, what contains it, roots, and the broad folders themselves.
+func TestCheckModelFolder(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "a", "home")
+	os.MkdirAll(filepath.Join(home, "models", "sub"), 0o755)
+	os.MkdirAll(filepath.Join(home, "state"), 0o755)
+	docs := known(t, windows.FOLDERID_Documents)
+	roaming := known(t, windows.FOLDERID_RoamingAppData)
+	refused := []string{home, filepath.Join(home, "state"), filepath.Join(home, "logs"), filepath.Join(home, "engine"), filepath.Join(base, "a"), base[:3], docs,
+		known(t, windows.FOLDERID_Desktop), known(t, windows.FOLDERID_Downloads), known(t, windows.FOLDERID_Pictures), known(t, windows.FOLDERID_Music), known(t, windows.FOLDERID_Videos),
+		known(t, windows.FOLDERID_Profile), filepath.Dir(known(t, windows.FOLDERID_Profile)), known(t, windows.FOLDERID_Windows), known(t, windows.FOLDERID_ProgramFiles), known(t, windows.FOLDERID_ProgramFilesX86),
+		filepath.Dir(roaming), roaming, known(t, windows.FOLDERID_LocalAppData)}
+	for _, p := range refused {
+		if err := CheckModelFolder(p, home); err == nil {
+			t.Errorf("%s was accepted", p)
+		} else if !strings.Contains(err.Error(), "older") {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+	for _, p := range []string{filepath.Join(home, "models"), filepath.Join(home, "models", "sub"), filepath.Join(base, "other"), filepath.Join(docs, "cr-agent-no-such-folder"), filepath.Join(known(t, windows.FOLDERID_Downloads), "x", "y")} {
+		if err := CheckModelFolder(p, home); err != nil {
+			t.Errorf("%s was refused: %v", p, err)
+		}
+	}
+	// Every other drive's root, which nothing else in the list covers.
+	for _, d := range "DEFGHIJ" {
+		root := string(d) + `:\`
+		if _, err := os.ReadDir(root); err == nil && CheckModelFolder(root, home) == nil {
+			t.Errorf("the drive root %s was accepted", root)
+		}
+	}
+	if !IsOwnModelFolder(filepath.Join(home, "models", "sub"), home) || IsOwnModelFolder(filepath.Join(home, "state"), home) || IsOwnModelFolder(home, home) {
+		t.Error("what counts as the agent's own model folder is wrong")
+	}
+	// A link or a short name changes nothing.
+	link := filepath.Join(base, "link")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, docs).CombinedOutput(); err != nil {
+		t.Logf("mklink failed: %v %s", err, out)
+	} else {
+		defer os.Remove(link)
+		if CheckModelFolder(link, home) == nil {
+			t.Error("a junction to Documents was accepted")
+		}
+		if CheckModelFolder(filepath.Join(link), filepath.Join(home)) == nil {
+			t.Error("a junction to Documents was accepted")
+		}
+	}
+	link2 := filepath.Join(base, "link2")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link2, filepath.Join(home, "state")).CombinedOutput(); err == nil {
+		defer os.Remove(link2)
+		if CheckModelFolder(link2, home) == nil {
+			t.Error("a junction into the agent's state was accepted")
+		}
+	} else {
+		t.Logf("mklink failed: %v %s", err, out)
+	}
+	if short := shortName(known(t, windows.FOLDERID_ProgramFiles)); short != "" {
+		if CheckModelFolder(short, home) == nil {
+			t.Errorf("the short name %s was accepted", short)
+		}
+	}
+}
+
+func shortName(p string) string {
+	p16, _ := windows.UTF16PtrFromString(p)
+	buf := make([]uint16, 300)
+	n, err := windows.GetShortPathName(p16, &buf[0], 300)
+	if err != nil || n == 0 {
+		return ""
+	}
+	s := windows.UTF16ToString(buf)
+	if strings.EqualFold(s, p) {
+		return ""
+	}
+	return s
+}
+
+// The grant never lands on a folder or file through a link, and does not cross one below the folder.
+func TestGrantDoesNotFollowLinks(t *testing.T) {
+	target, parent := t.TempDir(), t.TempDir()
+	link := filepath.Join(parent, "door")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput(); err != nil {
+		t.Skipf("mklink failed: %v %s", err, out)
+	}
+	defer os.Remove(link)
+	if _, err := GrantModelFolder(link); err == nil {
+		t.Fatal("a grant through a junction was made")
+	}
+	if _, err := GrantModelFolder(filepath.Join(link, "sub")); err == nil {
+		t.Fatal("a grant below a junction was made")
+	}
+	os.WriteFile(filepath.Join(target, "m.gguf"), []byte("x"), 0o644)
+	for _, model := range []string{filepath.Join(link, "m.gguf"), filepath.Join(target, "m.gguf")} {
+		if err := prepareModel(link, model, nil); err == nil {
+			t.Fatalf("prepareModel took a junction as the folder, for %s", model)
+		}
+	}
+	if CanEngineRead(target) {
+		t.Fatal("the target gained the entry")
+	}
+	// A junction inside a granted folder: the entry stays on this side of it.
+	if _, err := GrantModelFolder(parent); err != nil {
+		t.Fatal(err)
+	}
+	if CanEngineRead(target) {
+		t.Fatal("the grant crossed a junction below the folder")
+	}
+}
+
+// Added is reported only when the entry is new, and the revoke takes it from what inherited it too.
+func TestGrantAndRevoke(t *testing.T) {
+	folder := t.TempDir()
+	file := filepath.Join(folder, "m.gguf")
+	os.WriteFile(file, []byte("x"), 0o644)
+	added, err := GrantModelFolder(folder)
+	if err != nil || !added || !CanEngineRead(file) {
+		t.Fatalf("first grant: %v %v, file readable %v", added, err, CanEngineRead(file))
+	}
+	if again, err := GrantModelFolder(folder); err != nil || again {
+		t.Fatalf("second grant: %v %v", again, err)
+	}
+	var reported []string
+	moved := filepath.Join(folder, "moved.gguf")
+	elsewhere := t.TempDir()
+	src := filepath.Join(elsewhere, "moved.gguf")
+	os.WriteFile(src, []byte("x"), 0o644)
+	if err := os.Rename(src, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareModel(folder, moved, func(p string) { reported = append(reported, p) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(reported) != 1 || reported[0] != moved {
+		t.Fatalf("reported %v", reported)
+	}
+	for _, p := range []string{folder, moved} {
+		if err := RevokeModelGrant(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{folder, file, moved} {
+		if CanEngineRead(p) {
+			t.Errorf("%s still has the entry", p)
+		}
+	}
+	// The real agent reports only new entries: a folder it just granted is reported once.
+	reported = nil
+	if err := prepareModel(folder, file, func(p string) { reported = append(reported, p) }); err != nil || len(reported) != 1 || reported[0] != folder {
+		t.Fatalf("after the revoke: %v %v", reported, err)
 	}
 }

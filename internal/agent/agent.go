@@ -67,7 +67,11 @@ type Config struct {
 	// ModelGrant names the model folder the agent may let the sandbox read at a load: its own, or the one
 	// the host allowed. "" means it changes no permissions.
 	ModelGrant func() string
-	HFToken    func() string // absent | present | invalid; nil: not reported
+	// ModelGranted is told each path a read entry was added to, so that it can be taken away again.
+	ModelGranted func(path string)
+	// ModelFolderCheck says why the current model folder cannot be used; nil when it can.
+	ModelFolderCheck func() error
+	HFToken          func() string // absent | present | invalid; nil: not reported
 
 	// OnChange is called when anything the tray shows may have changed. It must not block.
 	OnChange func()
@@ -295,7 +299,7 @@ func (a *Agent) Level() supervisor.Level {
 
 // wakeCheck is the default check of an engine kept across a sleep: /health, then one token.
 func wakeCheck(ctx context.Context, base, key, alias string) error {
-	c := &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: supervisor.DialEngine}, Timeout: 20 * time.Second}
+	c := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true, DialContext: supervisor.DialEngine}, Timeout: 20 * time.Second}
 	do := func(method, path, body string) error {
 		req, err := http.NewRequestWithContext(ctx, method, base+path, strings.NewReader(body))
 		if err != nil {
@@ -804,6 +808,9 @@ func (a *Agent) cmdLoad(s *link.Session, id string, args *protocol.LoadArgs, pau
 		if errors.Is(err, errNoCUDAUnderLowIL) {
 			msg = EngineNoCUDALowIL + ": the engine got no GPU in its sandbox with these settings"
 		}
+		if errors.Is(err, errFolderRefused) { // the path and the reason stay on the PC
+			msg = EngineFolderRefused + ": the model folder on this PC cannot be used; only the host can choose another, on the PC"
+		}
 		a.cmdErr(s, id, code, "", msg)
 		return
 	}
@@ -902,6 +909,16 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 			return nil, err
 		}
 	}
+	if a.cfg.ModelFolderCheck != nil {
+		if err := a.cfg.ModelFolderCheck(); err != nil { // nothing is started and nothing is granted
+			a.mu.Lock()
+			a.state, a.engineErr, a.settings, a.loadedID = protocol.EngineError, EngineFolderRefused, nil, ""
+			a.mu.Unlock()
+			a.log.Error("load refused: the model folder cannot be used", "why", err.Error())
+			a.sendStatus(false)
+			return nil, fmt.Errorf("%w: %v", errFolderRefused, err)
+		}
+	}
 	a.mu.Lock()
 	level, gpuSelect := supervisor.LevelAppContainer, ""
 	if a.lowIntegrityOK {
@@ -916,6 +933,7 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 	if a.cfg.ModelGrant != nil {
 		sc.ModelGrant = a.cfg.ModelGrant()
 	}
+	sc.OnGrant = a.cfg.ModelGranted
 	t0 := time.Now()
 	eng, err := a.cfg.Start(lctx, sc)
 	wantGPU := st.GPULayers.All || st.GPULayers.N > 0
@@ -934,15 +952,12 @@ func (a *Agent) loadHeld(ctx context.Context, modelID, path string, st protocol.
 	}
 	switch {
 	case errors.Is(err, supervisor.ErrSandboxUnavailable):
-		// An engine error, never a start with weaker isolation (ruling B63). Nothing from the hub or a
-		// model can cause this, before any of the child ran, so it may raise the host's own offer.
+		// An engine error, never a start with weaker isolation (ruling B63). A model can have caused this:
+		// the container's own profile is writable from inside. Start has already made that profile anew and
+		// tried again, so only the agent's own probe may now raise the host's offer.
 		a.setSandboxResult("failed: " + level.String() + " cannot be used on this PC")
 		a.log.Error("the engine's isolation cannot be used on this PC", "isolation", level.String(), "err", err.Error())
-		if level == supervisor.LevelAppContainer {
-			a.mu.Lock()
-			a.sandboxBlocked = true
-			a.mu.Unlock()
-		}
+		probeForOffer()
 	case err != nil:
 		a.setSandboxResult("failed: the engine did not start at " + level.String())
 		probeForOffer()
@@ -1006,6 +1021,11 @@ const (
 )
 
 var errNoCUDAUnderLowIL = errors.New("the engine holds no CUDA context in its sandbox")
+
+// EngineFolderRefused is the engine error of a stored model folder the sandbox must not be given.
+const EngineFolderRefused = "model_folder_refused"
+
+var errFolderRefused = errors.New("the model folder cannot be used")
 
 // SandboxBlocked reports that the AppContainer does not work on this PC, by the agent's own evidence. The
 // tray then offers the host the opt-in to low integrity.

@@ -2,7 +2,12 @@ package relay
 
 import (
 	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -41,5 +46,30 @@ func TestRewriteBody(t *testing.T) {
 	}
 	if _, status, _, _ := rewriteBody([]byte(`{"messages":[{"role":"user","content":"x"}],"n":1}`), "a", true); status != 0 {
 		t.Errorf("n=1 refused")
+	}
+}
+
+// Each request takes a new connection: over the sandbox's Unix socket a kept-alive one can stall for ever.
+func TestEachRequestTakesANewConnection(t *testing.T) {
+	var conns atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) }))
+	srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	r := New(func() (string, string, string, bool) { return srv.URL, "", "", true }, nil)
+	for i := 0; i < 3; i++ {
+		resp, err := r.Client.Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if n := conns.Load(); n != 3 {
+		t.Fatalf("%d connections for 3 requests", n)
 	}
 }

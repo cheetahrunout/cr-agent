@@ -38,8 +38,10 @@ Both start the same text. There is no measurable difference.
 
 ## How it works
 
-- **Profile:** `CreateAppContainerProfile` with the name `cr-agent-engine`. It is per user and needs no administrator rights. It stays behind after an uninstall (`%LOCALAPPDATA%\Packages\cr-agent-engine`), empty and harmless.
-- **Socket:** an AppContainer cannot be reached on loopback without `CheckNetIsolation LoopbackExempt` or `NetworkIsolationSetAppContainerConfig`, which are documented as needing an administrator; that route was not tried. llama-server listens on a Unix socket when `--host` ends in `.sock`, and that needs no exemption and no capability. The socket is `e-<random>.sock` in the container's own `AC\Temp`, which the container can write. B15's check that the answer comes from the engine uses `SIO_AF_UNIX_GETPEERPID` in place of the TCP table.
+- **Profile:** `CreateAppContainerProfile`, named `cr-agent-engine-<hash of the agent's folder>`. It is per user and needs no administrator rights. It stays behind after an uninstall (under `%LOCALAPPDATA%\Packages`), empty and harmless.
+- **Reset:** the profile is the one place the container can write, so a model can rename or fill it. It is deleted and made anew (the SID comes from the name and stays the same) at every agent start, and again whenever the socket cannot be made there. So a model cannot break the sandbox for later loads, and the offer of low integrity goes up only if that retry fails and the agent's own probe also finds no CUDA device.
+- **UI:** at both levels the Job Object has every UI limit on (`JobObjectBasicUIRestrictions`, 0xFF) and the child gets an empty desktop of its own, never shown. Without them `BitBlt` and window enumeration work from inside, and the answers leave through the relay. The limits alone are not enough: with them on, measured, 227 titled windows fell to 1 but a copy of the screen still held all 1087 colours. On its own desktop it sees no other window and copies nothing. Win32k lockdown (`PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON`) would be stronger, but the engine then fails to start: a DLL it needs cannot initialize.
+- **Socket:** an AppContainer cannot be reached on loopback without `CheckNetIsolation LoopbackExempt` or `NetworkIsolationSetAppContainerConfig`, which are documented as needing an administrator; that route was not tried. llama-server listens on a Unix socket when `--host` ends in `.sock`, and that needs no exemption and no capability. The socket is `e-<random>.sock` in the container's own `AC\Temp`, which the container can write. B15's check that the answer comes from the engine uses `SIO_AF_UNIX_GETPEERPID` in place of the TCP table. Every request takes a new connection: on a kept-alive connection over this socket, about 1 request in 50 never got an answer, while a new connection to the same engine answered at once.
 - **Read access:** one read-only entry for ALL APPLICATION PACKAGES (`S-1-15-2-1`) on the engine folder and the model folder. A file moved in from elsewhere keeps its own permissions, so each load also checks the `.gguf` files beside the model.
 - **No silent weakening (B63):** a sandbox that cannot be set up is an engine error, and the old start at normal integrity after a token refusal is gone.
 
@@ -65,7 +67,11 @@ With the container's own SID on a file, a low-integrity process stops getting th
 
 This is **not possible without changing that folder's permissions**. An AppContainer can read only what names it or ALL APPLICATION PACKAGES, and a normal folder on any drive names neither. llama-server opens the model by path, so the agent cannot hand it an open file instead.
 
-So the agent's own folder (`<home>\models`) is granted at load. For another folder, choosing it under *Model folder…* asks the host, and the host's **Allow** adds the one read-only entry. A folder chosen before 0.2.3 has no such click: the tray says at start that the engine cannot read it, a load fails as an engine error, and choosing the folder again is the way out. Nothing is granted silently.
+So `<home>\models` and below are granted at load. For another folder, choosing it under *Model folder…* asks the host, and the host's **Allow** adds the one read-only entry.
+
+Some folders are refused outright, because a grant reaches everything below it and any AppContainer on the PC: the rest of `<home>` (it holds the keys), any folder that contains `<home>`, drive roots, the profile, `Windows`, `Program Files`, and Documents, Desktop, Downloads, Pictures, Music, Videos and `AppData` themselves, taken from the system's known-folder paths. Their subfolders are allowed after **Allow**. The path is resolved first, so a link or short name changes nothing, and no grant is made through a reparse point. A stored folder that is now refused gives an engine error (`model_folder_refused`) and a tray notice, and no grant.
+
+The agent records each entry it adds (`engine_grants`) and takes those away when the model folder changes, so an entry the host made is never touched. A folder chosen before 0.2.3 has no such click: the tray says at start that the engine cannot read it, a load fails as an engine error, and choosing the folder again is the way out. Nothing is granted silently.
 
 The deny-only token would have read `D:\` without any change, but only because everything else on `D:\` is readable to it as well.
 
@@ -83,8 +89,11 @@ There is one PC. A failure of the sandbox on any of these is an engine error, no
 - Antivirus products.
 - Windows 10 before 1803, which has no Unix sockets. A non-ASCII socket file name worked here, but a real non-ASCII user name was not tried.
 - A model folder on exFAT, which has no permissions.
-- Other ways out of an AppContainer than TCP and DNS, such as a local service with a loose named pipe.
 
 ## Not protected
 
-The engine can still read what ALL APPLICATION PACKAGES can read, such as `C:\Windows` and `Program Files`, and parts of HKCU. It can use the GPU and the memory its job allows.
+The engine can still read what ALL APPLICATION PACKAGES can read, such as `C:\Windows` and `Program Files`. It can use the GPU and the memory its job allows.
+
+**HKCU is readable.** Measured from inside: `Environment`, `Software`, `Software\Classes`, Explorer's settings and `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`; `Volatile Environment` and `Network` are not. So a secret in a user environment variable is open to a model. The agent therefore has no `HF_TOKEN` way in any more: a token is stored through the tray only, in DPAPI state the sandbox cannot read. **Next to try:** Low-privilege AppContainer (LPAC), which does not get ALL APPLICATION PACKAGES' access. It listed the GPU here, but its load and speed were not measured, and it would need its own grants instead of the ALL APPLICATION PACKAGES entry.
+
+**Named pipes and services are a known limit.** From inside, the engine can still reach local named pipes and services whose own permissions admit an AppContainer. Nothing is done about them in this release.

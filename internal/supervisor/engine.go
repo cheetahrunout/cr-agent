@@ -33,10 +33,12 @@ type Config struct {
 	// ModelGrant is a model folder the agent may let the AppContainer read: its own, or one the host allowed.
 	// Empty for any other: then the sandbox can read the model only if the folder already allows it.
 	ModelGrant string
-	GPUSelect  string        // "" or "all": every GPU; "0".."7": only that one (CUDA_VISIBLE_DEVICES)
-	MemLimit   uint64        // job memory cap, 0 = none
-	Deadline   time.Duration // load deadline (ruling B28: 5 min)
-	Log        *slog.Logger
+	// OnGrant is told each path a read entry was added to, so that the entry can be taken away again.
+	OnGrant   func(path string)
+	GPUSelect string        // "" or "all": every GPU; "0".."7": only that one (CUDA_VISIBLE_DEVICES)
+	MemLimit  uint64        // job memory cap, 0 = none
+	Deadline  time.Duration // load deadline (ruling B28: 5 min)
+	Log       *slog.Logger
 }
 
 // Engine is a running llama-server.
@@ -111,7 +113,7 @@ func Start(ctx context.Context, c Config) (*Engine, error) {
 	var port int
 	base := ""
 	if c.Level == LevelAppContainer {
-		if err := prepareSandbox(dir, c.ModelGrant, c.ModelPath); err != nil {
+		if err := prepareSandbox(dir, c.ModelGrant, c.ModelPath, c.OnGrant); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrSandboxUnavailable, err)
 		}
 		if l.Socket, err = newSocketPath(); err != nil {
@@ -165,7 +167,7 @@ func Start(ctx context.Context, c Config) (*Engine, error) {
 func (e *Engine) waitHealthy(ctx context.Context, deadline time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: DialEngine}}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true, DialContext: DialEngine}}
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -196,8 +198,14 @@ var (
 	sockets   = map[string]string{}
 )
 
+// engineHostPrefix marks a base URL that exists only in this table.
+const engineHostPrefix = "cr-engine-"
+
+// ErrEngineGone means a request named an engine that has stopped. It is never looked up as a real name.
+var ErrEngineGone = errors.New("that engine has stopped")
+
 func registerSocket(path string) string {
-	host := "cr-engine-" + randHex(8)
+	host := engineHostPrefix + randHex(8)
 	socketsMu.Lock()
 	sockets[host+":80"] = path
 	socketsMu.Unlock()
@@ -227,6 +235,10 @@ func DialEngine(ctx context.Context, network, addr string) (net.Conn, error) {
 	if path != "" {
 		return d.DialContext(ctx, "unix", path)
 	}
+	// Forgotten after a Stop that raced this request. A prompt must not go to whatever answers to that name.
+	if strings.HasPrefix(strings.ToLower(addr), engineHostPrefix) {
+		return nil, ErrEngineGone
+	}
 	return d.DialContext(ctx, network, addr)
 }
 
@@ -243,10 +255,14 @@ func ProbeCUDA(engineDir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := prepareSandbox(dir, "", ""); err != nil {
-		return false, err
+	// A sandbox that cannot be set up shows no device: the probe is how that reaches the offer.
+	if err := prepareSandbox(dir, "", "", nil); err != nil {
+		return false, nil
 	}
 	p, err := spawn(spawnOptions{Exe: filepath.Join(dir, "llama-server.exe"), Args: []string{"--list-devices"}, Dir: dir, Level: LevelAppContainer})
+	if errors.Is(err, ErrSandboxUnavailable) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

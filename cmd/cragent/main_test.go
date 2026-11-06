@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -218,22 +221,6 @@ func TestImportAlwaysTells(t *testing.T) {
 	}
 }
 
-func TestUnderFolder(t *testing.T) {
-	home := filepath.Join(t.TempDir(), "home")
-	for dir, want := range map[string]bool{
-		home:                                   true,
-		filepath.Join(home, "models"):          true,
-		filepath.Join(home, "models", "sub"):   true,
-		filepath.Dir(home):                     false,
-		home + "-other":                        false,
-		filepath.Join(home, "..", "elsewhere"): false,
-	} {
-		if underFolder(dir, home) != want {
-			t.Errorf("%s: %v", dir, !want)
-		}
-	}
-}
-
 // The question says what changes and for whom, and names the folder.
 func TestModelFolderQuestion(t *testing.T) {
 	q := modelFolderQuestion(`D:\\Models`)
@@ -257,5 +244,68 @@ func TestOptInSaysWhatItGivesUp(t *testing.T) {
 	}
 	if !strings.Contains(isolationText(supervisor.LevelAppContainer), "AppContainer") || !strings.Contains(isolationText(supervisor.LevelLowIntegrity), "read your files") {
 		t.Error("the About text does not say the level")
+	}
+}
+
+// A token comes only from the store: the sandbox can read HKCU\\Environment.
+func TestTokenIsNotReadFromTheEnvironment(t *testing.T) {
+	t.Setenv("HF_TOKEN", "hf_from_the_environment")
+	st, err := store.OpenWith(t.TempDir(), plainProtector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if got := storedToken(st, log); got != "" {
+		t.Fatalf("token %q", got)
+	}
+	if err := st.WriteSecret(store.SecretHFToken, []byte("hf_stored")); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedToken(st, log); got != "hf_stored" {
+		t.Fatalf("token %q", got)
+	}
+}
+
+// Only what the agent added is taken away; a host's own entry, or another folder's, stays.
+func TestRevokeOnlyWhatTheAgentAdded(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows permissions")
+	}
+	st, err := store.OpenWith(t.TempDir(), plainProtector{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mine, hosts, other := t.TempDir(), t.TempDir(), t.TempDir()
+	added, err := supervisor.GrantModelFolder(mine)
+	if err != nil || !added {
+		t.Fatal(added, err)
+	}
+	recordGrant(st, mine)
+	recordGrant(st, mine)
+	if added, err := supervisor.GrantModelFolder(other); err != nil || !added {
+		t.Fatal(added, err)
+	}
+	recordGrant(st, other)
+	// The host made this one: the agent found it there, so it is not in the record.
+	if out, err := exec.Command("icacls", hosts, "/grant", "*S-1-15-2-1:(OI)(CI)(RX)").CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	if added, err := supervisor.GrantModelFolder(hosts); err != nil || added {
+		t.Fatal(added, err)
+	}
+	revokeGrants(st, hosts, log)
+	if !supervisor.CanEngineRead(hosts) {
+		t.Fatal("a host's own entry was taken away")
+	}
+	revokeGrants(st, mine, log)
+	if supervisor.CanEngineRead(mine) {
+		t.Fatal("the entry the agent added stayed")
+	}
+	if !supervisor.CanEngineRead(other) {
+		t.Fatal("another folder's entry was taken away")
+	}
+	if got := st.Config().EngineGrants; len(got) != 1 || got[0] != other {
+		t.Fatalf("record %v", got)
 	}
 }

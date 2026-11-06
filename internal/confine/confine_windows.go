@@ -95,3 +95,26 @@ func Links(f *os.File) (uint32, error) {
 	}
 	return info.NumberOfLinks, nil
 }
+
+// FinalPath is the path Windows finally reaches for an existing file or folder: links followed, short
+// names expanded, no \\?\ prefix.
+func FinalPath(path string) (string, error) {
+	p16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", err
+	}
+	h, err := windows.CreateFile(p16, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return "", err
+	}
+	defer windows.CloseHandle(h)
+	got, err := finalPathOfHandle(h)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(got, `\\?\UNC\`) {
+		return `\\` + got[len(`\\?\UNC\`):], nil
+	}
+	return strings.TrimPrefix(got, `\\?\`), nil
+}

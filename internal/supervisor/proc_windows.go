@@ -36,12 +36,13 @@ const (
 
 // spawnOptions controls how the child is started.
 type spawnOptions struct {
-	Exe       string
-	Args      []string
-	Dir       string
-	Level     Level  // how the child is isolated; there is no level below low integrity
-	MemLimit  uint64 // job memory cap in bytes, 0 = none
-	GPUSelect string
+	Exe        string
+	Args       []string
+	Dir        string
+	Level      Level  // how the child is isolated; there is no level below low integrity
+	noUILimits bool   // tests only: the control that shows what the job's UI limits are stopping
+	MemLimit   uint64 // job memory cap in bytes, 0 = none
+	GPUSelect  string
 }
 
 func spawn(o spawnOptions) (*proc, error) {
@@ -72,6 +73,9 @@ func spawn(o spawnOptions) (*proc, error) {
 	// from the desktop's DC still works under them, measured), which is why the child also has a desktop of
 	// its own below. CUDA needs neither.
 	ui := windows.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: uiRestrictAll}
+	if o.noUILimits {
+		ui.UIRestrictionsClass = 0
+	}
 	if _, err := windows.SetInformationJobObject(job, jobObjectBasicUIRestrictions,
 		uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui))); err != nil {
 		return nil, fmt.Errorf("%w: UI restrictions: %v", ErrSandboxUnavailable, err)

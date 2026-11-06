@@ -99,6 +99,10 @@ func TestMain(m *testing.M) {
 		sabotageChild(os.Args[i+1])
 		return
 	}
+	if i := indexOf(os.Args, "--clip-child"); i >= 0 {
+		clipChild(os.Args[i+1], os.Args[i+2], os.Args[i+3])
+		return
+	}
 	if i := indexOf(os.Args, "--ui-child"); i >= 0 {
 		uiChild(os.Args[i+1])
 		return
@@ -436,6 +440,11 @@ func sabotageChild(temp string) {
 // startChild runs this test binary at a level, with the given flag, and returns what it printed.
 func startChild(t *testing.T, level Level, args ...string) string {
 	t.Helper()
+	return startChildWith(t, spawnOptions{Level: level}, args...)
+}
+
+func startChildWith(t *testing.T, o spawnOptions, args ...string) string {
+	t.Helper()
 	engineDir := t.TempDir()
 	self, err := os.Executable()
 	if err != nil {
@@ -452,7 +461,8 @@ func startChild(t *testing.T, level Level, args ...string) string {
 	if err := prepareSandbox(engineDir, "", "", nil); err != nil {
 		t.Fatal(err)
 	}
-	p, err := spawn(spawnOptions{Exe: exe, Args: args, Dir: engineDir, Level: level})
+	o.Exe, o.Args, o.Dir = exe, args, engineDir
+	p, err := spawn(o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,8 +577,8 @@ func TestContainersAreScopedByFolder(t *testing.T) {
 }
 
 // uiProbe is what a process can see of the desktop: the titled windows of other processes, how many colours
-// a copy of the screen holds (one means it got nothing), and whether it can open the clipboard.
-func uiProbe(atomName string) (others, colours int, clipboard, atom bool) {
+// a copy of the screen holds (one means it got nothing), and a global atom of this session.
+func uiProbe(atomName string) (others, colours int, atom bool) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	u := windows.NewLazySystemDLL("user32.dll")
@@ -603,27 +613,23 @@ func uiProbe(atomName string) (others, colours int, clipboard, atom bool) {
 			}
 		}
 	}
-	if ok, _, _ := u.NewProc("OpenClipboard").Call(0); ok != 0 {
-		clipboard = true
-		u.NewProc("CloseClipboard").Call()
-	}
 	// The session's global atoms: only the job's limits give the child a table of its own.
 	if atomName != "" {
 		name, _ := windows.UTF16PtrFromString(atomName)
 		a, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalFindAtomW").Call(uintptr(unsafe.Pointer(name)))
 		atom = a != 0
 	}
-	return others, len(seen), clipboard, atom
+	return others, len(seen), atom
 }
 
 func uiChild(atomName string) {
-	others, colours, clip, atom := uiProbe(atomName)
-	fmt.Printf("others=%d colours=%d clipboard=%v atom=%v\n", others, colours, clip, atom)
+	others, colours, atom := uiProbe(atomName)
+	fmt.Printf("others=%d colours=%d atom=%v\n", others, colours, atom)
 }
 
-// The screen, other windows' titles and the clipboard are closed at both levels.
+// The screen and other windows' titles are closed at both levels. The clipboard has its own test.
 func TestSandboxCannotSeeTheDesktop(t *testing.T) {
-	others, colours, _, _ := uiProbe("")
+	others, colours, _ := uiProbe("")
 	t.Logf("this test itself: others=%d colours=%d", others, colours)
 	atomName := fmt.Sprintf("cr-agent-test-atom-%d", os.Getpid())
 	name, _ := windows.UTF16PtrFromString(atomName)
@@ -637,8 +643,8 @@ func TestSandboxCannotSeeTheDesktop(t *testing.T) {
 		out := strings.TrimSpace(startChild(t, level, "--ui-child", atomName))
 		t.Logf("%v: %s", level, out)
 		var o, c int
-		var clip, atom bool
-		if _, err := fmt.Sscanf(out, "others=%d colours=%d clipboard=%v atom=%v", &o, &c, &clip, &atom); err != nil {
+		var atom bool
+		if _, err := fmt.Sscanf(out, "others=%d colours=%d atom=%v", &o, &c, &atom); err != nil {
 			t.Fatalf("%v: %q: %v", level, out, err)
 		}
 		if o != 0 {
@@ -646,9 +652,6 @@ func TestSandboxCannotSeeTheDesktop(t *testing.T) {
 		}
 		if c > 1 {
 			t.Errorf("%v: a copy of the screen holds %d colours", level, c)
-		}
-		if clip {
-			t.Errorf("%v: can open the clipboard", level)
 		}
 		if atom {
 			t.Errorf("%v: finds a global atom of this session: the job's UI limits are off", level)
@@ -840,5 +843,144 @@ func TestGrantAndRevoke(t *testing.T) {
 	reported = nil
 	if err := prepareModel(folder, file, func(p string) { reported = append(reported, p) }); err != nil || len(reported) != 1 || reported[0] != folder {
 		t.Fatalf("after the revoke: %v %v", reported, err)
+	}
+}
+
+var (
+	clipUser   = windows.NewLazySystemDLL("user32.dll")
+	clipKernel = windows.NewLazySystemDLL("kernel32.dll")
+)
+
+const cfUnicodeText = 13
+
+func clipFormat(name string) uintptr {
+	n, _ := windows.UTF16PtrFromString(name)
+	f, _, _ := clipUser.NewProc("RegisterClipboardFormatW").Call(uintptr(unsafe.Pointer(n)))
+	return f
+}
+
+func clipAlloc(s string) uintptr {
+	b, _ := windows.UTF16FromString(s)
+	const gmemMoveable = 2
+	h, _, _ := clipKernel.NewProc("GlobalAlloc").Call(gmemMoveable, uintptr(len(b)*2))
+	p, _, _ := clipKernel.NewProc("GlobalLock").Call(h)
+	copy(unsafe.Slice(*(**uint16)(unsafe.Pointer(&p)), len(b)), b)
+	clipKernel.NewProc("GlobalUnlock").Call(h)
+	return h
+}
+
+// clipRead is the text held under a format on an open clipboard, or "" when the call gives nothing.
+func clipRead(format uintptr) string {
+	h, _, _ := clipUser.NewProc("GetClipboardData").Call(format)
+	if h == 0 {
+		return ""
+	}
+	p, _, _ := clipKernel.NewProc("GlobalLock").Call(h)
+	if p == 0 {
+		return ""
+	}
+	defer clipKernel.NewProc("GlobalUnlock").Call(h)
+	return windows.UTF16PtrToString(*(**uint16)(unsafe.Pointer(&p)))
+}
+
+func clipOpen(tries int) (bool, error) {
+	var last error
+	for i := 0; i < tries; i++ {
+		ok, _, e := clipUser.NewProc("OpenClipboard").Call(0)
+		if ok != 0 {
+			return true, nil
+		}
+		last = e
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false, last
+}
+
+// clipChild tries the clipboard's data calls. It prints only whether it got anything, never what it got,
+// and it never empties the clipboard or writes text: if a limit failed, the host's data must survive this.
+func clipChild(formatName, known, written string) {
+	runtime.LockOSThread()
+	opened, err := clipOpen(30)
+	fmt.Printf("open=%v\n", opened)
+	if !opened {
+		fmt.Printf("open_error=%q\n", fmt.Sprint(err))
+		return
+	}
+	defer clipUser.NewProc("CloseClipboard").Call()
+	fmt.Printf("read_planted=%v\n", clipRead(clipFormat(formatName)) == known)
+	fmt.Printf("read_text=%v\n", clipRead(cfUnicodeText) != "")
+	h, _, _ := clipUser.NewProc("SetClipboardData").Call(clipFormat(written), clipAlloc("written by the sandbox"))
+	fmt.Printf("write=%v\n", h != 0)
+}
+
+// The clipboard's data is closed at both levels, on the session's own clipboard, the one a real engine
+// shares. What counts is the data calls: OpenClipboard alone answers true at low integrity whenever
+// nobody else holds the clipboard. Only a private format is added, plus known text if the clipboard holds no
+// text, so the host's data stays; they go with the host's next copy.
+//
+// A control with the job's UI limits off shows what the limits stop. A clipboard this test cannot open, or that a
+// child could not get open, proves nothing, so that is a skip with its reason, never a pass.
+func TestSandboxCannotUseTheClipboard(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	const known = "known text the sandbox must not read"
+	format := fmt.Sprintf("CR-Agent-Test-%d", os.Getpid())
+	opened, err := clipOpen(200)
+	if !opened {
+		t.Skipf("for 10 s this test itself could not open the session's clipboard, so it says nothing about the sandbox: %v", err)
+	}
+	h, _, e := clipUser.NewProc("SetClipboardData").Call(clipFormat(format), clipAlloc(known))
+	if avail, _, _ := clipUser.NewProc("IsClipboardFormatAvailable").Call(cfUnicodeText); avail == 0 {
+		clipUser.NewProc("SetClipboardData").Call(cfUnicodeText, clipAlloc(known))
+	}
+	planted := clipRead(clipFormat(format)) == known && clipRead(cfUnicodeText) != ""
+	clipUser.NewProc("CloseClipboard").Call()
+	if h == 0 || !planted {
+		t.Skipf("this test could not plant on the session's clipboard, so it says nothing about the sandbox: %v", e)
+	}
+
+	run := func(o spawnOptions, written string) string {
+		t.Helper()
+		out := ""
+		for try := 0; try < 3; try++ {
+			out = startChildWith(t, o, "--clip-child", format, known, written)
+			if strings.Contains(out, "open=true") {
+				break
+			}
+		}
+		return strings.Join(strings.Fields(out), " ")
+	}
+	type label struct {
+		level Level
+		name  string
+	}
+	for _, c := range []label{{LevelAppContainer, "appcontainer"}, {LevelLowIntegrity, "low_integrity"}} {
+		control := run(spawnOptions{Level: c.level, noUILimits: true}, format+"-control-"+c.name)
+		t.Logf("%s, limits off: %s", c.name, control)
+		written := format + "-written-" + c.name
+		out := run(spawnOptions{Level: c.level}, written)
+		t.Logf("%s, as shipped: %s", c.name, out)
+
+		// Held by someone else all the while? Then a child that never got it open proves nothing.
+		if opened, err := clipOpen(40); !opened {
+			t.Skipf("%s: the clipboard was held by another program around the check, so it says nothing: %v", c.name, err)
+		}
+		avail, _, _ := clipUser.NewProc("IsClipboardFormatAvailable").Call(clipFormat(written))
+		still := clipRead(clipFormat(format))
+		clipUser.NewProc("CloseClipboard").Call()
+		for _, bad := range []string{"read_planted=true", "read_text=true", "write=true"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("%s: %s", c.name, bad)
+			}
+		}
+		if avail != 0 {
+			t.Errorf("%s: what the sandbox wrote is on the clipboard", c.name)
+		}
+		if still != known {
+			t.Skipf("%s: another program replaced the clipboard during the check, so it says nothing more", c.name)
+		}
+		if c.level == LevelLowIntegrity && !strings.Contains(out, "open=true") {
+			t.Skipf("%s: the child never got the clipboard open, so the data calls were not tried: %s", c.name, out)
+		}
 	}
 }

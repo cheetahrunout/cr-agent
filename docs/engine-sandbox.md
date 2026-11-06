@@ -94,6 +94,8 @@ There is one PC. A failure of the sandbox on any of these is an engine error, no
 
 The engine can still read what ALL APPLICATION PACKAGES can read, such as `C:\Windows` and `Program Files`. It can use the GPU and the memory its job allows.
 
+**The clipboard.** A private desktop shares its window station's clipboard, so what closes it is the job's `READCLIPBOARD` and `WRITECLIPBOARD` limits, on the data calls. `OpenClipboard` proves nothing: at low integrity it succeeds whenever nobody else holds the clipboard, and in an AppContainer the system denies it. Measured once on a free clipboard with the limits on: low integrity opened it, and `GetClipboardData` and `SetClipboardData` got nothing. The test holds this on every run where it can reach the clipboard; if another program holds it, the test skips and says so.
+
 **HKCU is readable.** Measured from inside: `Environment`, `Software`, `Software\Classes`, Explorer's settings and `Software\Microsoft\Windows NT\CurrentVersion\Winlogon`; `Volatile Environment` and `Network` are not. So a secret in a user environment variable is open to a model. The agent therefore has no `HF_TOKEN` way in any more: a token is stored through the tray only, in DPAPI state the sandbox cannot read. **Next to try:** Low-privilege AppContainer (LPAC), which does not get ALL APPLICATION PACKAGES' access. It listed the GPU here, but its load and speed were not measured, and it would need its own grants instead of the ALL APPLICATION PACKAGES entry.
 
 **Named pipes and services are a known limit.** From inside, the engine can still reach local named pipes and services whose own permissions admit an AppContainer. Nothing is done about them in this release.

@@ -1,5 +1,12 @@
 {
   "product": "cr-agent",
   "comment": "Public keys that may sign cr-agent releases (PLAN ruling B20). Embedded in the agent and the launcher; read by the hub. There is no production key yet: the owner adds the output of 'signtool pubkey' here. The throwaway test key must never be listed.",
-  "keys": []
+  "keys": [
+    {
+      "added": "2026-11-06",
+      "key_id": "842328cb9895cb27",
+      "public_key": "RWSEIyjLmJXLJ8mGc2PUwBIDCMRUvP/XkJNk9SRwp65UWbLJMuty1C2u",
+      "status": "current"
+    }
+  ]
 }

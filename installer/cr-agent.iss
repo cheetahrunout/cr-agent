@@ -1,6 +1,6 @@
 ; Inno Setup 6 script for the CR agent (PLAN §9.1, §13).
 ;
-; Per user, no admin. Installs into %LOCALAPPDATA%\cr-agent:
+; Per user, no admin. Installs into %LOCALAPPDATA%\cr-agent, or a folder the host chooses at the first install:
 ;   launcher.exe                 the stable launcher (Start menu and autostart point at it)
 ;   current.json                 {"version": "<this version>"}, written after the files are in place
 ;   versions\<version>\          cragent.exe and the launcher this release ships
@@ -31,7 +31,9 @@ AppVersion={#AppVersion}
 AppVerName=CR Agent {#AppVersion}
 AppPublisher=CR Local AI Hub
 DefaultDirName={localappdata}\cr-agent
-DisableDirPage=yes
+; The folder is chosen at the first install. Installing over an existing agent keeps its folder, with its pairing and models.
+DisableDirPage=auto
+DirExistsWarning=no
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 PrivilegesRequired=lowest
@@ -119,10 +121,138 @@ begin
   Sleep(500);
 end;
 
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function GetVolumeInformation(Root, VolumeName: String; VolumeNameSize: Cardinal; var Serial, MaxLength, Flags: Cardinal; FileSystem: String; FileSystemSize: Cardinal): Cardinal;
+  external 'GetVolumeInformationW@kernel32.dll stdcall';
+function GetDriveType(Root: String): Cardinal;
+  external 'GetDriveTypeW@kernel32.dll stdcall';
+
+function IsUnder(Dir, Parent: String): Boolean;
 begin
-  CloseRunningAgent;
+  Dir := Lowercase(AddBackslash(Dir));
+  Parent := Lowercase(AddBackslash(Parent));
+  Result := Copy(Dir, 1, Length(Parent)) = Parent;
+end;
+
+// True when the folder holds anything. An agent that is already there does not count: that is a reinstall.
+function HoldsOtherFiles(Dir: String): Boolean;
+var
+  F: TFindRec;
+begin
+  Result := False;
+  if FileExists(Dir + '\launcher.exe') then
+    Exit;
+  if FindFirst(Dir + '\*', F) then
+  begin
+    try
+      repeat
+        if (F.Name <> '.') and (F.Name <> '..') then
+          Result := True;
+      until Result or not FindNext(F);
+    finally
+      FindClose(F);
+    end;
+  end;
+end;
+
+// Why this folder cannot hold the agent, in words for the host; empty when it can. The agent keeps its keys here, updates
+// itself here without admin rights, and its engine's sandbox depends on the folder's permissions, which need NTFS or ReFS.
+function FolderProblem(Dir: String): String;
+var
+  Serial, MaxLength, Flags: Cardinal;
+  Name, FileSystem, Probe: String;
+  Created: Boolean;
+begin
   Result := '';
+  if Copy(Dir, 1, 2) = '\\' then
+  begin
+    Result := 'Choose a folder on a drive in this PC, not on a network.';
+    Exit;
+  end;
+  if GetDriveType(ExtractFileDrive(Dir) + '\') <> 3 then
+  begin
+    Result := 'Choose a folder on a fixed drive in this PC, not on a network or removable drive.';
+    Exit;
+  end;
+  Name := StringOfChar(' ', 64);
+  FileSystem := StringOfChar(' ', 64);
+  if GetVolumeInformation(ExtractFileDrive(Dir) + '\', Name, 64, Serial, MaxLength, Flags, FileSystem, 64) = 0 then
+  begin
+    Result := 'This drive cannot be read. Choose another.';
+    Exit;
+  end;
+  FileSystem := Uppercase(Trim(Copy(FileSystem, 1, Pos(#0, FileSystem + #0) - 1)));
+  if (FileSystem <> 'NTFS') and (FileSystem <> 'REFS') then
+  begin
+    Result := 'CR Agent needs a drive formatted as NTFS, because it protects its keys and the engine with file permissions. This drive is ' + FileSystem + '.';
+    Exit;
+  end;
+  if IsUnder(Dir, ExpandConstant('{win}')) or IsUnder(Dir, ExpandConstant('{commonpf32}')) or IsUnder(Dir, ExpandConstant('{commonpf64}')) then
+  begin
+    Result := 'CR Agent updates itself without administrator rights, so it cannot live in Program Files or Windows. Choose another folder.';
+    Exit;
+  end;
+  if HoldsOtherFiles(Dir) then
+  begin
+    Result := 'This folder already holds other files. Choose a new or empty folder: CR Agent makes it private to you.';
+    Exit;
+  end;
+  Created := not DirExists(Dir);
+  Probe := Dir + '\.cr-agent-write-test';
+  if not ForceDirectories(Dir) or not SaveStringToFile(Probe, 'x', False) then
+  begin
+    Result := 'You cannot write to this folder without administrator rights. Choose another.';
+    Exit;
+  end;
+  DeleteFile(Probe);
+  if Created then
+    RemoveDir(Dir);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Problem: String;
+begin
+  Result := True;
+  if CurPageID = wpSelectDir then
+  begin
+    Problem := FolderProblem(WizardDirValue);
+    if Problem <> '' then
+    begin
+      MsgBox(Problem, mbError, MB_OK);
+      Result := False;
+    end;
+  end;
+end;
+
+// %LOCALAPPDATA% is private to the person by default. Another drive usually lets every user of this PC change what is on it,
+// and the launcher runs at sign-in, so a folder elsewhere gets the same three entries the default one has.
+function MakePrivate(Dir: String): Boolean;
+var
+  Code: Integer;
+  Icacls: String;
+begin
+  Icacls := ExpandConstant('{sys}\icacls.exe');
+  Result := ForceDirectories(Dir)
+    and Exec(Icacls, '"' + Dir + '" /grant:r "' + ExpandConstant('{username}') + ':(OI)(CI)F" *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F', '', SW_HIDE, ewWaitUntilTerminated, Code)
+    and (Code = 0)
+    and Exec(Icacls, '"' + Dir + '" /inheritance:r', '', SW_HIDE, ewWaitUntilTerminated, Code)
+    and (Code = 0);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Dir: String;
+begin
+  Dir := ExpandConstant('{app}');
+  // Also here, for an install without the wizard page (/DIR= on a silent install).
+  Result := FolderProblem(Dir);
+  if Result <> '' then
+    Exit;
+#ifndef Scratch
+  CloseRunningAgent;
+#endif
+  if not IsUnder(Dir, ExpandConstant('{localappdata}')) and not MakePrivate(Dir) then
+    Result := 'The permissions of this folder could not be set, so CR Agent was not installed. Choose another folder.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -134,6 +264,8 @@ end;
 
 function InitializeUninstall(): Boolean;
 begin
+#ifndef Scratch
   CloseRunningAgent;
+#endif
   Result := True;
 end;

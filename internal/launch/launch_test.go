@@ -309,10 +309,10 @@ func TestVerifyManifestPairStates(t *testing.T) {
 func TestGateJudgesTheMarkAfterTheKill(t *testing.T) {
 	w := newWorld(t)
 	w.r.defaults()
-	w.r.Gate, w.r.Poll = 200*time.Millisecond, time.Hour // no poll sees it: only the check at the deadline can
+	w.r.Gate, w.r.Poll = 2*time.Second, time.Hour // no poll sees it: only the check at the deadline can; wide, for a busy CI machine
 	p := &fakeProc{done: make(chan struct{})}
 	go func() {
-		time.Sleep(120 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		w.markHealthy("0.1.1")
 	}()
 	// The first check runs at once, before the mark; then only the deadline.

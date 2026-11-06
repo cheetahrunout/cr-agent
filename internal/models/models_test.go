@@ -823,7 +823,7 @@ func TestIndexAloneGrantsNothing(t *testing.T) {
 	if err := e.m.SetDir(other); err != nil {
 		t.Fatal(err)
 	}
-	if _, lerr := e.m.Resolve("wiz"); lerr == nil || lerr.Code != protocol.ErrDenied {
+	if _, lerr := e.m.Resolve("wiz"); lerr == nil || lerr.Code != protocol.ErrNotFound {
 		t.Fatalf("an entry only the index names: %v", lerr)
 	}
 	// The way out is the ordinary one: the host is asked, and on Allow the file on disk is used by its hash.
@@ -857,7 +857,7 @@ func TestPlantedIndexForAnAllowlistedPublisher(t *testing.T) {
 	if err := e.m.SetDir(other); err != nil {
 		t.Fatal(err)
 	}
-	if _, lerr := e.m.Resolve("planted"); lerr == nil || lerr.Code != protocol.ErrDenied {
+	if _, lerr := e.m.Resolve("planted"); lerr == nil || lerr.Code != protocol.ErrNotFound {
 		t.Fatalf("a planted index for an allowlisted publisher: %v", lerr)
 	}
 	// A real download of those same names, with the index then changed to state the planted hash, is refused too.

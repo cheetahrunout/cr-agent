@@ -628,6 +628,40 @@ func (m *Manager) refreshImported() {
 	}
 }
 
+// settleUnrecorded is for a model folder that outlived the agent's protected records, as after an uninstall and a new
+// install: the index says ready, but nothing here vouches for the files, so no load or header read would be allowed.
+// The hub must not be told they are ready. An imported file becomes changed, which the tray offers to add again; a
+// download becomes an error, which the hub offers to fetch again. Records that cannot be read say nothing either way.
+func (m *Manager) settleUnrecorded() {
+	if m.o.Store == nil {
+		return
+	}
+	if _, err := m.loadHashes(); err != nil {
+		return
+	}
+	if _, err := m.loadApprovals(); err != nil {
+		return
+	}
+	m.mu.Lock()
+	dirty := false
+	for _, e := range m.index {
+		if e.State != StateReady || (m.trusted(e) && m.recorded(e)) {
+			continue
+		}
+		m.log.Warn("this PC has no record of this model, so it is not offered", "model_id", e.ModelID)
+		if e.imported() {
+			e.State = StateChanged
+		} else {
+			e.State = StateError
+		}
+		dirty = true
+	}
+	if dirty {
+		m.saveLocked()
+	}
+	m.mu.Unlock()
+}
+
 // forget removes an entry's approval and hash records (ruling B64: delete only forgets).
 func (m *Manager) forget(e *Entry) error {
 	if m.o.Store == nil {

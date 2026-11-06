@@ -206,6 +206,7 @@ func New(o Options) (*Manager, error) {
 	if err := m.open(o.Dir); err != nil {
 		return nil, err
 	}
+	m.settleUnrecorded()
 	return m, nil
 }
 
@@ -272,6 +273,7 @@ func (m *Manager) SetDir(dir string) error {
 	if err := m.open(dir); err != nil {
 		return err
 	}
+	m.settleUnrecorded()
 	m.o.OnChange(true)
 	return nil
 }

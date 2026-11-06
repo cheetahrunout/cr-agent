@@ -357,7 +357,7 @@ func TestPlantedImportedEntry(t *testing.T) {
 	os.WriteFile(filepath.Join(e.root, indexName), j, 0o644)
 	e.m.Close()
 	e.open()
-	if _, lerr := e.m.Resolve("planted"); lerr == nil || lerr.Code != protocol.ErrDenied {
+	if _, lerr := e.m.Resolve("planted"); lerr == nil || lerr.Code != protocol.ErrNotFound {
 		t.Fatalf("load: %v", lerr)
 	}
 	if _, ierr := e.m.Inspect(context.Background(), &protocol.InspectArgs{Repo: "local-file/planted", Commit: sha[:40], File: "planted.gguf"}); ierr == nil || ierr.Code != protocol.ErrNotFound {
@@ -964,5 +964,65 @@ func TestSweepLeavesTheHostsFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatal("the sweep went through a junction")
+	}
+}
+
+// An uninstall removes the protected records and keeps the model folder. After a new install nothing is claimed as ready:
+// the imported file can be added again by the host, the download fetched again, and neither loads until then.
+func TestFolderOutlivesTheRecords(t *testing.T) {
+	e := newEnv(t)
+	e.put("kept.gguf", e.model)
+	found := e.m.Scan().Found
+	if len(found) != 1 {
+		t.Fatalf("found %+v", found)
+	}
+	got := e.m.Import(context.Background(), found, nil)
+	if len(got) != 1 || got[0].Err != "" {
+		t.Fatalf("import %+v", got)
+	}
+	id := got[0].ModelID
+	if _, lerr := e.m.Resolve(id); lerr != nil {
+		t.Fatalf("before: %v", lerr)
+	}
+	if len(e.m.Scan().Found) != 0 {
+		t.Fatal("a ready file is offered")
+	}
+
+	// Still ready after a plain restart: the records are there.
+	e.m.Close()
+	e.open()
+	if _, lerr := e.m.Resolve(id); lerr != nil {
+		t.Fatalf("after a restart: %v", lerr)
+	}
+
+	// The records go.
+	e.m.Close()
+	if err := e.st.WriteSecret(store.SecretModelHashes, []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	e.open()
+	var state string
+	for _, x := range e.m.Models() {
+		if x.ModelID == id {
+			state = x.State
+		}
+	}
+	if state != StateChanged {
+		t.Fatalf("state %q", state)
+	}
+	if _, lerr := e.m.Resolve(id); lerr == nil {
+		t.Fatal("it loads without a record")
+	}
+	// The host's click brings it back, under the same id.
+	found = e.m.Scan().Found
+	if len(found) != 1 {
+		t.Fatalf("not offered again: %+v", found)
+	}
+	got = e.m.Import(context.Background(), found, nil)
+	if len(got) != 1 || got[0].Err != "" || got[0].ModelID != id {
+		t.Fatalf("import again %+v", got)
+	}
+	if _, lerr := e.m.Resolve(id); lerr != nil {
+		t.Fatalf("after adding again: %v", lerr)
 	}
 }

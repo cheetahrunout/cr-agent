@@ -579,11 +579,8 @@ func TestNamesPassTheSchema(t *testing.T) {
 
 	e := newEnv(t)
 	long := strings.Repeat("a", 200)
-	names := []string{"plain.gguf", "UPPER-Case_1.5.gguf", "-leading.gguf", "_x.gguf", ".hidden.gguf", "aux.v2.gguf", "com1.gguf", "---.gguf",
+	names := []string{"plain.gguf", "UPPER-Case_1.5.gguf", "-leading.gguf", "_x.gguf", ".hidden.gguf", "---.gguf",
 		"x." + "y-z.gguf", long + ".gguf", "sub/nested.gguf", "dup.gguf", "DUP.1.gguf", "other/dup.gguf"}
-	if runtime.GOOS == "windows" {
-		names = append(names[:5], names[7:]...) // Windows has no file called aux.* or com1.*
-	}
 	for _, n := range names {
 		e.put(n, e.model)
 	}

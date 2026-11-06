@@ -6,7 +6,8 @@
 # It refuses a working tree with any uncommitted change and prints the commit it builds, so the
 # signature seals a known commit. The engine zips are fetched from the official release and refused
 # unless they match engine.lock. The folder ends up holding the two archives, the installer, the
-# unsigned manifest.json (its notes name the commit), SHA256SUMS.txt and BUILD.txt.
+# unsigned manifest.json (its notes name the commit), SHA256SUMS.txt and BUILD.txt. Everything is scanned with Microsoft
+# Defender before it reaches that folder: a flag stops the build, so nothing flagged is ever signed.
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$Out,
@@ -36,6 +37,8 @@ try {
     if ($RollbackTest) { $build.RollbackTest = $true }
     if ($Iscc) { $build.Iscc = $Iscc }
     & (Join-Path $PSScriptRoot "build-installer.ps1") @build
+
+    & (Join-Path $PSScriptRoot "scan-defender.ps1") -Path (Join-Path $work "release\stage"), (Join-Path $work "release\dist")
 
     New-Item -ItemType Directory -Force $Out | Out-Null
     Get-ChildItem (Join-Path $work "release\dist") -File | ForEach-Object { Move-Item $_.FullName (Join-Path $Out $_.Name) }

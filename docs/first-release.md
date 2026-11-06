@@ -4,7 +4,21 @@ Release files are built on this PC from the local checkout, the owner signs them
 
 The old `v0.1.x` drafts and tags on GitHub are unsigned leftovers. They are never to be signed or published. The owner may delete them.
 
-## What the owner does
+## Signing from now on: one double-click (ruling B69)
+
+The sections below describe the first release, signed by hand. For later releases:
+
+1. Double-click `C:\Users\Admin\Desktop\AI\signing-tool\Sign release.bat`.
+2. Compare the code it shows with the one the lead gave you, and type Y.
+3. Type your passphrase. Nothing appears while you type.
+4. It signs, checks and publishes on GitHub, then shows a file, `upload-to-hub-<version>.json`.
+5. On the hub: Admin, *Add a release*, *Upload release file*.
+
+If it stops halfway, run it again: a release that is signed already does not ask for the passphrase again.
+
+The code is worked out by that script. If you want the check that does not depend on any file on this PC, run `Get-FileHash` as in (b) below.
+
+## What the owner did for the first release
 
 Four short steps. About 5 minutes.
 
@@ -94,7 +108,7 @@ Not the owner's job. In order.
 
     pwsh -File scripts\build-signtool.ps1
 
-It prints the commit and SHA-256 and writes them beside the tool, in `signtool.exe.txt`. Tell the owner that value: they compare
+It scans the tool with Microsoft Defender (a flagged tool is deleted, never excluded), prints the commit and SHA-256 and writes them beside the tool, in `signtool.exe.txt`. Tell the owner that value: they compare
 it with `Get-FileHash` before running the tool. The line the tool prints about itself is only an accident check. It refuses to replace the tool unless told to: rebuilding is a separate
 reviewed step, after reading the diff of `cmd/signtool`, `internal/sign`, `internal/release`, `internal/trust`, `protocol` and `scripts`
 (`-Rebuild`). Never rebuild it right before signing: what protects the passphrase is that the owner compares the tool with a hash fixed earlier.

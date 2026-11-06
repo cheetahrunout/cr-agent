@@ -33,10 +33,26 @@ if ((Test-Path $Out) -and -not $Rebuild) {
 $commit = (git rev-parse HEAD).Trim()
 New-Item -ItemType Directory -Force (Split-Path -Parent $Out) | Out-Null
 $env:CGO_ENABLED = "0"
-& go build -trimpath -o $Out ./cmd/signtool
-if ($LASTEXITCODE -ne 0) { throw "the build failed" }
+try {
+    & (Join-Path $PSScriptRoot "stamp-version.ps1") -Dir cmd\signtool -Version 1.0.0 -Description "CR Agent release signing tool" -FileName signtool.exe
+    & go build -trimpath -o $Out ./cmd/signtool
+    if ($LASTEXITCODE -ne 0) { throw "the build failed" }
+} finally {
+    Remove-Item cmd\signtool\resource_windows_amd64.syso -ErrorAction SilentlyContinue
+}
+# Nobody types a passphrase into a tool Defender objects to. Flagged means no tool, and nothing is excluded.
+try {
+    & (Join-Path $PSScriptRoot "scan-defender.ps1") -Path $Out
+} catch {
+    Remove-Item $Out -ErrorAction SilentlyContinue
+    throw
+}
 $sha = (Get-FileHash $Out -Algorithm SHA256).Hash.ToLower()
 [IO.File]::WriteAllText("$Out.txt", "built from commit $commit`nsha256 $sha`n")
+# The one-click signing goes beside the tool, so it too is a file that was looked at earlier and not whatever the checkout holds.
+foreach ($f in "Sign release.bat", "sign-release.ps1", "publish-release.ps1") {
+    Copy-Item (Join-Path $PSScriptRoot $f) (Join-Path (Split-Path -Parent $Out) $f) -Force
+}
 "built  $Out"
 "commit $commit"
 "sha256 $sha"

@@ -57,13 +57,22 @@ if ($DebugBuild) {
     $ldAgent = "-s -w -H windowsgui -X main.version=$Version"; $ldLauncher = "-s -w -H windowsgui"
 }
 if ($RollbackTest) { $ldAgent += " -X main.sabotage=unhealthy-$Version" }
-Run $Go ($common + @("-ldflags", $ldAgent, "-o", "$stage\versions\$Version\cragent.exe", "./cmd/cragent"))
-Run $Go ($common + @("-ldflags", $ldLauncher, "-o", "$stage\launcher.exe", "./cmd/launcher"))
-Copy-Item "$stage\launcher.exe" "$stage\versions\$Version\launcher.exe"
-# The tool that packs and hashes is always the plain console build.
-$toolBuild = @("build")
-if ($DebugBuild) { $toolBuild += @("-tags", "debug") }
-Run $Go ($toolBuild + @("-o", "$tools\signtool.exe", "./cmd/signtool"))
+$stamp = Join-Path $PSScriptRoot "stamp-version.ps1"
+$stamped = @("cmd\cragent", "cmd\launcher", "cmd\signtool")
+try {
+    & $stamp -Dir cmd\cragent -Version $Version -Description "CR Agent" -FileName cragent.exe
+    & $stamp -Dir cmd\launcher -Version $Version -Description "CR Agent launcher" -FileName launcher.exe
+    & $stamp -Dir cmd\signtool -Version $Version -Description "CR Agent release packing tool" -FileName signtool.exe
+    Run $Go ($common + @("-ldflags", $ldAgent, "-o", "$stage\versions\$Version\cragent.exe", "./cmd/cragent"))
+    Run $Go ($common + @("-ldflags", $ldLauncher, "-o", "$stage\launcher.exe", "./cmd/launcher"))
+    Copy-Item "$stage\launcher.exe" "$stage\versions\$Version\launcher.exe"
+    # The tool that packs and hashes is always the plain console build.
+    $toolBuild = @("build", "-trimpath")
+    if ($DebugBuild) { $toolBuild += @("-tags", "debug") }
+    Run $Go ($toolBuild + @("-o", "$tools\signtool.exe", "./cmd/signtool"))
+} finally {
+    foreach ($d in $stamped) { Remove-Item "$d\resource_windows_amd64.syso" -ErrorAction SilentlyContinue }
+}
 
 # 2. The engine, as the official zips have it (local notes such as SHA256SUMS are not part of it).
 Get-ChildItem -Path $EngineDir -File -Recurse | Where-Object { $_.Name -ne "SHA256SUMS" } | ForEach-Object {

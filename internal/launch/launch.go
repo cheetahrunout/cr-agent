@@ -70,6 +70,10 @@ func (r *Runner) defaults() {
 	}
 }
 
+// damaged is what the host reads when a file of the running version is missing or changed. Antivirus software removing
+// one is the usual reason, and the signature check is why the agent will not run without it.
+const damaged = "CR Agent did not start because one of its files is missing or changed, so this PC is not sharing now. Antivirus software may have removed it: check its history. Do not add an exclusion; tell whoever runs your hub."
+
 // gaveUp is what the host reads when the agent keeps failing. It does not advise reinstalling: the
 // usual causes pass (a model drive that is not connected yet).
 const gaveUp = "CR Agent could not start after several tries, so this PC is not sharing now. It tries again the next time you sign in, or start it from the Start menu. The reason is in its log, in the logs folder of CR Agent."
@@ -169,7 +173,7 @@ func (r *Runner) Run() int {
 		if err := Verify(r.Root, p.Version, r.Keys); err != nil {
 			if !trial {
 				r.Log.Error("the installed version cannot be started", "err", err.Error())
-				r.Notify(gaveUp)
+				r.Notify(damaged)
 				return 1
 			}
 			if _, rerr := r.revert(p, err.Error()); rerr != nil {

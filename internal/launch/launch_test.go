@@ -389,6 +389,35 @@ func TestRevertChecksThePreviousVersion(t *testing.T) {
 }
 
 // The launcher tells the host once when it gives up, without advising a reinstall.
+// Antivirus software takes a file of a version away. On trial the launcher goes back; otherwise it refuses and says why.
+func TestFileRemovedByAntivirus(t *testing.T) {
+	w := newWorld(t)
+	w.install("0.1.1", true)
+	w.install("0.1.2", true)
+	os.Remove(layout.AgentExe(w.root, "0.1.2"))
+	layout.WritePointer(w.root, pending("0.1.2", "0.1.1"))
+	w.behave["0.1.1"] = func(p *fakeProc, _ int) { p.exit(ExitQuit) }
+	if code, started := w.run(); code != 0 || started != "0.1.1" {
+		t.Fatalf("on trial: exit %d, started %q", code, started)
+	}
+	if p, err := layout.ReadPointer(w.root); err != nil || p.Version != "0.1.1" {
+		t.Fatalf("pointer %+v, %v", p, err)
+	}
+
+	w2 := newWorld(t)
+	w2.install("0.1.2", true)
+	os.Remove(layout.AgentExe(w2.root, "0.1.2"))
+	layout.WritePointer(w2.root, layout.Pointer{Version: "0.1.2"})
+	var told []string
+	w2.r.Notify = func(s string) { told = append(told, s) }
+	if code, started := w2.run(); code != 1 || started != "" {
+		t.Fatalf("not on trial: exit %d, started %q", code, started)
+	}
+	if len(told) != 1 || !strings.Contains(told[0], "Antivirus") {
+		t.Fatalf("told %q", told)
+	}
+}
+
 func TestGivingUpTellsTheHost(t *testing.T) {
 	w := newWorld(t)
 	w.install("0.1.0", true)

@@ -200,7 +200,7 @@ func (u *Updater) verifyFiles(m *release.Manifest, prefix string) error {
 		}
 		sum, size, err := hashFile(filepath.Join(u.cfg.Root, filepath.FromSlash(f.Path)))
 		if err != nil {
-			return fmt.Errorf("%s is missing", f.Path)
+			return fmt.Errorf("%s is missing (antivirus software may have removed it)", f.Path)
 		}
 		if sum != f.SHA256 || size != f.Size {
 			return fmt.Errorf("%s does not match the signed release", f.Path)

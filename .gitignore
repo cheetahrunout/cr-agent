@@ -1,6 +1,7 @@
 /dist/
 /build/
 *.exe
+*.syso
 *.gguf
 *.log
 .idea/

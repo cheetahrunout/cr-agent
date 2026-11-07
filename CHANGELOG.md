@@ -2,6 +2,11 @@
 
 Add a section here for every release, newest first: scripts\build-release.ps1 refuses a version without one. Its lines also go into the signed release's notes, so write them for the people who use the agent, keep them to plain text, and do not use double quotes.
 
+## 0.2.8
+
+- Up to 4 people can now use the loaded model on your PC at the same time, when the one using it agrees in the hub. Your graphics memory and the total context stay as you set them: the context is divided between the people sharing.
+- Each person sharing has their own part of the context, so one person's long message cannot end another person's answer.
+
 ## 0.2.7
 
 - Installing again into a folder that still holds your models now works.

@@ -186,7 +186,7 @@ func TestHubDrivesAgent(t *testing.T) {
 		{`{"ctx":4096,"gpu_layers":"all","threads":9999,"kv_type":"f16","flash_attn":"on"}`, "threads"},
 		{`{"ctx":1024,"gpu_layers":"all","threads":2,"kv_type":"f16","flash_attn":"on"}`, "ctx"},
 		{`{"ctx":4096,"gpu_layers":"all","threads":2,"kv_type":"q4_0","flash_attn":"on"}`, "kv_type"},
-		{`{"ctx":4096,"gpu_layers":"all","threads":2,"kv_type":"f16","flash_attn":"on","parallel":2}`, "parallel"},
+		{`{"ctx":4096,"gpu_layers":"all","threads":2,"kv_type":"f16","flash_attn":"on","parallel":5}`, "parallel"}, // 1..4 people at once (ruling B74)
 	} {
 		h.send(`{"v":1,"t":"cmd","id":"c-01JCKZ3Q9X8YB7N6M5P4R3S2T9","op":"load","args":{"model_id":"smollm2-360m-q8_0","settings":` + c.settings + `}}`)
 		e := h.next("cmd.err", 2*time.Second)

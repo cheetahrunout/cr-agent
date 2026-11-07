@@ -89,7 +89,7 @@
         "flash_attn": { "enum": ["on", "auto"] },
         "n_cpu_moe": { "type": "integer", "minimum": 0, "maximum": 1024 },
         "chat_template": { "type": "string", "pattern": "^[a-z0-9_-]{1,40}$" },
-        "parallel": { "type": "integer", "minimum": 1, "maximum": 4, "description": "fixed at 1 in v1" }
+        "parallel": { "type": "integer", "minimum": 1, "maximum": 4, "description": "slots: people sharing the engine at once, each with ctx / parallel of the cache (ruling B74); an agent without the parallel capability takes only 1" }
       }
     },
 
@@ -102,7 +102,7 @@
         "proto": { "$ref": "#/$defs/proto" },
         "platform": { "enum": ["windows-amd64", "linux-amd64", "darwin-arm64"] },
         "backend": { "enum": ["cuda", "metal", "vulkan", "cpu"] },
-        "capabilities": { "type": "array", "items": { "enum": ["chunked_bodies", "vision", "config", "inspect"] } },
+        "capabilities": { "type": "array", "items": { "enum": ["chunked_bodies", "vision", "config", "inspect", "parallel"] } },
         "supported_archs": { "type": "array", "items": { "type": "string" } },
         "llama_tag": { "type": "string" },
         "hardware": { "$ref": "#/$defs/hardware" },

@@ -41,11 +41,22 @@ func CheckSettings(s protocol.Settings, lim Limits) *protocol.FieldError {
 			return &protocol.FieldError{Field: "n_cpu_moe", Msg: fmt.Sprintf("must be 0..%d", lim.NLayer)}
 		}
 	}
-	// -np is fixed at 1 in v1 (ruling I2); the 1..4 bound is kept for later but not reachable.
-	if s.Parallel != nil && *s.Parallel != 1 {
-		return &protocol.FieldError{Field: "parallel", Msg: "must be 1 in this version"}
+	// Up to 4 people share one engine (ruling B74, which overturns I2's -np 1). The decoder has bounded it to 1..4 already.
+	if s.Parallel != nil && (*s.Parallel < 1 || *s.Parallel > MaxParallel) {
+		return &protocol.FieldError{Field: "parallel", Msg: fmt.Sprintf("must be 1..%d", MaxParallel)}
 	}
 	return nil
+}
+
+// MaxParallel is the most slots (people at once) an engine is started with (ruling B74).
+const MaxParallel = 4
+
+// Slots is the number of slots the settings ask for: 1 when they do not say.
+func Slots(s protocol.Settings) int {
+	if s.Parallel == nil || *s.Parallel < 1 {
+		return 1
+	}
+	return *s.Parallel
 }
 
 // DefaultSettings are the M0 defaults when the agent loads at start (--load) without the hub.
@@ -76,7 +87,9 @@ const socketOrigin = "http://cr-engine.invalid"
 
 // BuildArgs returns llama-server's arguments (without argv[0]). Fixed by the agent (§12.3): --jinja,
 // 127.0.0.1, random port, per-launch --api-key, --no-webui, --no-slots, --reasoning-format deepseek,
-// --fit off, no --metrics, no verbose flags, no file arguments except -m.
+// --fit off, no --metrics, no verbose flags, no file arguments except -m. -np is the number of people sharing the
+// engine, and -no-kvu splits the cache: each slot gets -c / -np of its own, so one person's long prompt is refused
+// at once instead of ending everyone's answer when a shared pool runs out (ruling B74).
 func BuildArgs(l Launch) []string {
 	s := l.Settings
 	ngl := "999"
@@ -107,7 +120,8 @@ func BuildArgs(l Launch) []string {
 		"-ctk", s.KVType,
 		"-ctv", s.KVType,
 		"-fa", s.FlashAttn,
-		"-np", "1",
+		"-np", strconv.Itoa(Slots(s)),
+		"-no-kvu",
 	)
 	if s.NCPUMoE != nil && *s.NCPUMoE > 0 {
 		args = append(args, "--n-cpu-moe", strconv.Itoa(*s.NCPUMoE))

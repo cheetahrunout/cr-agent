@@ -352,11 +352,13 @@ func (a *Agent) target() (string, string, string, bool) {
 	return b, k, al, true
 }
 
+// capabilities: "parallel" says that a load may ask for up to 4 slots, so the hub may offer sharing (ruling B74).
+// An agent without it refuses parallel != 1.
 func (a *Agent) capabilities() []string {
 	if a.cfg.Models != nil {
-		return []string{"config", "inspect"}
+		return []string{"config", "inspect", "parallel"}
 	}
-	return []string{"config"}
+	return []string{"config", "parallel"}
 }
 
 func (a *Agent) localModels() ([]protocol.LocalModel, []protocol.Job) {

@@ -15,13 +15,13 @@ func TestCheckSettings(t *testing.T) {
 	if fe := CheckSettings(ok, lim); fe != nil {
 		t.Fatalf("defaults refused: %v", fe)
 	}
-	two, moe := 2, 41
+	five, moe := 5, 41
 	cases := map[string]func(s *protocol.Settings){
 		"ctx":        func(s *protocol.Settings) { s.Ctx = 65536 }, // > n_ctx_train
 		"threads":    func(s *protocol.Settings) { s.Threads = 17 },
 		"gpu_layers": func(s *protocol.Settings) { s.GPULayers = protocol.Layers(42) },
 		"n_cpu_moe":  func(s *protocol.Settings) { s.NCPUMoE = &moe },
-		"parallel":   func(s *protocol.Settings) { s.Parallel = &two },
+		"parallel":   func(s *protocol.Settings) { s.Parallel = &five },
 		"kv_type":    func(s *protocol.Settings) { s.KVType = "q4_0" },
 		"flash_attn": func(s *protocol.Settings) { s.FlashAttn = "off" },
 	}
@@ -38,6 +38,19 @@ func TestCheckSettings(t *testing.T) {
 	if fe := CheckSettings(s, lim); fe != nil {
 		t.Errorf("n_layer+1 refused: %v", fe)
 	}
+	// Up to 4 people share one engine (ruling B74).
+	for n := 1; n <= 4; n++ {
+		s := DefaultSettings(8)
+		s.Parallel = &n
+		if fe := CheckSettings(s, lim); fe != nil {
+			t.Errorf("parallel %d refused: %v", n, fe)
+		}
+	}
+	zero := 0
+	s.Parallel = &zero
+	if fe := CheckSettings(s, lim); fe == nil || fe.Field != "parallel" {
+		t.Errorf("parallel 0: %v", fe)
+	}
 }
 
 func TestBuildArgs(t *testing.T) {
@@ -46,7 +59,7 @@ func TestBuildArgs(t *testing.T) {
 	args := BuildArgs(Launch{ModelPath: `C:\m\x.gguf`, Alias: "x", Port: 5555, APIKey: "k", Settings: s})
 	line := strings.Join(args, " ")
 	for _, want := range []string{"--cors-origins http://127.0.0.1:5555", "--no-cors-credentials", "--alias x", "--host 127.0.0.1", "--port 5555", "--api-key k", "--jinja", "--no-webui", "--no-slots",
-		"--fit off", "-c 4096", "-ngl 999", "-t 8", "-ctk q8_0", "-ctv q8_0", "-fa auto", "-np 1", "--reasoning-format deepseek"} {
+		"--fit off", "-c 4096", "-ngl 999", "-t 8", "-ctk q8_0", "-ctv q8_0", "-fa auto", "-np 1", "-no-kvu", "--reasoning-format deepseek"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q in %s", want, line)
 		}
@@ -56,6 +69,20 @@ func TestBuildArgs(t *testing.T) {
 		if slices.Contains(args, banned) {
 			t.Errorf("banned flag %q present", banned)
 		}
+	}
+	for _, kv := range []string{"-kvu", "--kv-unified"} {
+		if slices.Contains(args, kv) {
+			t.Errorf("a shared cache (%s) lets one long prompt end everyone's answer", kv)
+		}
+	}
+	three := 3
+	s.Parallel = &three
+	if line := strings.Join(BuildArgs(Launch{ModelPath: "m.gguf", Alias: "x", Port: 1, APIKey: "k", Settings: s}), " "); !strings.Contains(line, "-np 3 -no-kvu") || strings.Contains(line, "-np 1") {
+		t.Errorf("three people: %s", line)
+	}
+	s.Parallel = nil
+	if line := strings.Join(BuildArgs(Launch{ModelPath: "m.gguf", Alias: "x", Port: 1, APIKey: "k", Settings: s}), " "); !strings.Contains(line, "-np 1 -no-kvu") {
+		t.Errorf("no parallel given: %s", line)
 	}
 	s.GPULayers = protocol.Layers(12)
 	s.ChatTemplate = "chatml"

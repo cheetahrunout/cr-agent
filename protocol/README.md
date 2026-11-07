@@ -62,6 +62,7 @@ socket, 4003 machine revoked (stop reconnecting).
 - A download waiting its turn (one runs at a time) is reported as `running` with 0 bytes done.
 - `hello` has no `engine_error`: when an engine error is pending at connect, the agent sends a `status` frame right after `welcome`.
 - `hf_token` travels only in `hello`: a token set or removed while connected reaches the hub at the next connection.
+- Capability `parallel` (agent 0.2.8, ruling B74): a `load` may set `settings.parallel` to 1..4, the people sharing the engine at once. The engine gets `-np parallel -no-kvu`: each slot has `ctx / parallel` of the cache, and a request larger than its slot is refused by the engine without touching the others. An agent without the capability refuses `parallel` other than 1, so the hub offers sharing only to an agent that lists it. A hub older than this capability drops a `hello` that lists it, so the hub goes first.
 
 ## Frames
 
